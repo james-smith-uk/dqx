@@ -71,7 +71,7 @@ def test_save_to_table_rejects_unsafe_run_config_name(run_config_name: str):
     """save() with mode='overwrite' raises UnsafeSqlQueryError for run_config_name values outside the allowlist."""
     spark = create_autospec(SparkSession)
     ws = create_autospec(WorkspaceClient)
-    ws.tables.get.side_effect = NotFound("table not found")  # _table_exists → False
+    ws.tables.get.side_effect = NotFound("table not found")  # table_exists → False
 
     handler = TableChecksStorageHandler(ws, spark)
     config = TableChecksStorageConfig(
@@ -220,7 +220,7 @@ def test_save_in_append_mode_with_none_config_fingerprint_writes_to_new_table():
     """
     spark = create_autospec(SparkSession)
     ws = create_autospec(WorkspaceClient)
-    ws.tables.get.side_effect = NotFound("table not found")  # _table_exists → False
+    ws.tables.get.side_effect = NotFound("table not found")  # table_exists → False
 
     handler = TableChecksStorageHandler(ws, spark)
     config = TableChecksStorageConfig(
@@ -245,7 +245,7 @@ def test_save_in_append_mode_skips_write_when_computed_fingerprint_already_exist
     """
     spark = create_autospec(SparkSession)
     ws = create_autospec(WorkspaceClient)
-    # _table_exists → True (ws.tables.get does not raise)
+    # table_exists → True (ws.tables.get does not raise)
     spark.read.table.return_value.schema.fields = [_MockField(c) for c in _VERSIONING_COLUMNS]
     # First isEmpty() → fingerprint already in table → idempotency guard fires;
     # second isEmpty() → no rows with NULL expanded_rule_fingerprints → no backfill
@@ -272,7 +272,7 @@ def test_save_in_append_mode_proceeds_when_computed_fingerprint_differs_from_exi
     """
     spark = create_autospec(SparkSession)
     ws = create_autospec(WorkspaceClient)
-    # _table_exists → True
+    # table_exists → True
     spark.read.table.return_value.schema.fields = [_MockField(c) for c in _VERSIONING_COLUMNS]
     # isEmpty() returns True → no matching fingerprint in table → write proceeds
     spark.read.table.return_value.filter.return_value.isEmpty.return_value = True

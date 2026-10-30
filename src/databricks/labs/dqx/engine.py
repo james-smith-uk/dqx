@@ -7,6 +7,7 @@ import threading
 import re
 import sys
 from concurrent import futures
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import cached_property
@@ -15,12 +16,12 @@ from uuid import uuid4
 
 import pyspark.sql.functions as F
 from pyspark.errors import AnalysisException
-from pyspark.sql import DataFrame, Observation, SparkSession
+from pyspark.sql import Column, DataFrame, Observation, SparkSession
 from pyspark.sql.streaming import StreamingQuery
 
 from databricks.labs.dqx.base import DQEngineBase, DQEngineCoreBase
 from databricks.labs.dqx.checks_resolver import resolve_custom_check_functions_from_path
-from databricks.labs.dqx.checks_serializer import deserialize_checks
+from databricks.labs.dqx.checks_serializer import ChecksNormalizer, deserialize_checks, serialize_checks
 from databricks.labs.dqx.rule_fingerprint import (
     compute_rule_set_fingerprint,
     compute_rule_set_fingerprint_by_metadata,
@@ -30,6 +31,7 @@ from databricks.labs.dqx.checks_storage import (
     FileChecksStorageHandler,
     BaseChecksStorageHandlerFactory,
     ChecksStorageHandlerFactory,
+    TableChecksStorageHandler,
     is_table_location,
 )
 from databricks.labs.dqx.config import (
@@ -37,6 +39,7 @@ from databricks.labs.dqx.config import (
     OutputConfig,
     FileChecksStorageConfig,
     BaseChecksStorageConfig,
+    TableChecksStorageConfig,
     RunConfig,
     ExtraParams,
     ActionEventsConfig,
@@ -56,7 +59,7 @@ from databricks.labs.dqx.rule import (
     CHECK_FUNC_REGISTRY_ORIGINAL_COLUMNS_PRESELECTION,
 )
 from databricks.labs.dqx.checks_validator import ChecksValidator, ChecksValidationStatus
-from databricks.labs.dqx.schema import dq_result_schema
+from databricks.labs.dqx.schema import dq_checks_schema, dq_result_schema
 from databricks.labs.dqx.metrics_observer import DQMetricsObservation, DQMetricsObserver
 from databricks.labs.dqx.metrics_listener import StreamingMetricsListener
 from databricks.labs.dqx.io import read_input_data, save_dataframe_as_table, get_reference_dataframes
@@ -68,7 +71,14 @@ from databricks.labs.dqx.errors import (
     InvalidParameterError,
     TerminalActionError,
 )
-from databricks.labs.dqx.utils import list_tables, safe_strip_file_from_path, resolve_variables, VariableValue
+from databricks.labs.dqx.utils import (
+    list_tables,
+    normalize_bound_args,
+    safe_filter_expr,
+    safe_strip_file_from_path,
+    resolve_variables,
+    VariableValue,
+)
 from databricks.labs.dqx.io import is_one_time_trigger
 from databricks.labs.dqx.actions.base import ActionContext, ActionResult, ActionServices
 from databricks.labs.dqx.actions.dq_action import DQAction
@@ -119,6 +129,17 @@ class DQEngineCore(DQEngineCoreBase):
                 ColumnArguments.INFO.value, DefaultColumnNames.INFO.value
             ),
         }
+        # The checks log and the *_checks* column are one feature: the column is only added when the log is
+        # enabled, so every row's *_checks* value can be decoded against the logged rule set.
+        self._checks_log_location = extra_params.checks_log_location
+        if self._checks_log_location:
+            self._result_column_names[ColumnArguments.CHECKS] = extra_params.result_column_names.get(
+                ColumnArguments.CHECKS.value, DefaultColumnNames.CHECKS.value
+            )
+        # Rule sets already written to the checks log by this engine: rule_set_fingerprint -> run config names.
+        # Guarded by a lock because apply_checks_and_save_in_tables applies run configs on a thread pool.
+        self._logged_rule_sets: dict[str, set[str]] = {}
+        self._logged_rule_sets_lock = threading.Lock()
 
         self.spark = SparkSession.builder.getOrCreate() if spark is None else spark
         self.run_time_overwrite = (
@@ -166,6 +187,89 @@ class DQEngineCore(DQEngineCoreBase):
         Raises:
             InvalidCheckError: If any of the checks are invalid.
         """
+        return self._apply_checks(df, checks, ref_dfs)
+
+    @property
+    def checks_log_location(self) -> str | None:
+        """Table name of the checks log, or None when the checks log is disabled."""
+        return self._checks_log_location
+
+    def log_checks(
+        self,
+        checks: list[DQRule] | list[dict],
+        run_config_name: str = "default",
+        custom_check_functions: dict[str, Callable] | None = None,
+    ) -> str:
+        """Save a rule set to the checks log, so results produced with it can be decoded per row.
+
+        Checks given as metadata are logged exactly as written. *DQRule* objects are logged via
+        *serialize_checks*; Column arguments that are not simple column references are stored as their display
+        text, so the logged definition is for reference only and may not reload as the same expression.
+
+        The checks are applied with the same rule set fingerprint as the log entry. A rule set already in the
+        log for *run_config_name* is not written again. Inside a Spark Declarative Pipeline the log table must
+        already exist; call this method once outside the pipeline to create it.
+
+        Args:
+            checks: Checks to log, either as *DQRule* objects or as metadata (list of dicts).
+            run_config_name: Run configuration name to store the rule set under (use "default" if not provided).
+            custom_check_functions: Optional dictionary with custom check functions used by metadata checks
+                (e.g., *globals()* of the calling module).
+
+        Returns:
+            The rule set fingerprint of the logged checks.
+
+        Raises:
+            InvalidConfigError: If the checks log is not enabled (*ExtraParams.checks_log_location* is not set),
+                or inside a Spark Declarative Pipeline if the checks log table does not exist.
+            InvalidParameterError: If *checks* is empty.
+            InvalidCheckError: If any of the checks are invalid, or two checks with a complex Column argument share
+                a rule fingerprint.
+        """
+        if not self._checks_log_location:
+            raise InvalidConfigError("The checks log is not enabled: set 'checks_log_location' in ExtraParams.")
+        if not checks:
+            raise InvalidParameterError("No checks to log.")
+
+        if DQEngineCore._all_are_dq_rules(cast(list[DQRule], checks)):
+            rules = cast(list[DQRule], checks)
+            source_checks = None
+        elif all(isinstance(check, dict) for check in checks):
+            source_checks = cast(list[dict], checks)
+            rules = deserialize_checks(source_checks, custom_check_functions)
+        else:
+            raise InvalidCheckError("All elements in the 'checks' list must be either DQRule instances or dicts.")
+
+        DQEngineCore._validate_unique_rule_fingerprints(rules)
+        rule_set_fingerprint = compute_rule_set_fingerprint(rules)
+        self._write_checks_log(rules, rule_set_fingerprint, run_config_name, source_checks, custom_check_functions)
+        return rule_set_fingerprint
+
+    def _apply_checks(
+        self,
+        df: DataFrame,
+        checks: list[DQRule],
+        ref_dfs: dict[str, DataFrame] | None = None,
+        source_checks: list[dict] | None = None,
+        custom_check_functions: dict[str, Callable] | None = None,
+    ) -> DataFrame | tuple[DataFrame, Observation]:
+        """Apply data quality checks to the given DataFrame.
+
+        Args:
+            df: Input DataFrame to check.
+            checks: List of checks to apply. Each check must be a *DQRule* instance.
+            ref_dfs: Optional reference DataFrames to use in the checks.
+            source_checks: The metadata the checks were deserialized from, if any. When the checks log is enabled,
+                it is logged as written; otherwise the checks are serialized for the log.
+            custom_check_functions: Custom check functions used by *source_checks*.
+
+        Returns:
+            A DataFrame with the result columns and an optional Observation which tracks data quality
+            summary metrics.
+
+        Raises:
+            InvalidCheckError: If any of the checks are invalid.
+        """
         self._validate_result_column_collisions(df)
 
         if not checks:
@@ -185,7 +289,10 @@ class DQEngineCore(DQEngineCoreBase):
         warning_checks = self._get_check_columns(checks, Criticality.WARN.value)
         error_checks = self._get_check_columns(checks, Criticality.ERROR.value)
 
-        rule_set_fingerprint = compute_rule_set_fingerprint(checks) if checks else None
+        rule_set_fingerprint = compute_rule_set_fingerprint(checks)
+        if self._checks_log_location:
+            DQEngineCore._validate_unique_rule_fingerprints(checks)
+            self._ensure_checks_logged(checks, rule_set_fingerprint, source_checks, custom_check_functions)
         reference_cache: dict[tuple[str, str], DataFrame] = {}
         checks_before_row_changes = itertools.takewhile(_keeps_input_rows, error_checks + warning_checks)
         input_managers = {
@@ -235,12 +342,20 @@ class DQEngineCore(DQEngineCoreBase):
             reference_cache=reference_cache,
             input_managers=input_managers,
         )
+        skipped_checks = skipped_error_checks | skipped_warning_checks
+        if self._checks_log_location:
+            result_df = result_df.withColumn(
+                self._result_column_names[ColumnArguments.CHECKS],
+                self._build_checks_column(
+                    rule_set_fingerprint, [_build_not_applied_expr(check, skipped_checks) for check in checks]
+                ),
+            )
         if shared_aggregates:
             result_df = result_df.drop(*[aggregate.metric_col for aggregate in shared_aggregates])
 
         # Duplicate check names are intentionally preserved — if two rules share a name,
         # check_metrics will report each occurrence separately so the user can spot the overlap.
-        observed_result = self._observe_metrics(result_df, checks, skipped_error_checks | skipped_warning_checks)
+        observed_result = self._observe_metrics(result_df, checks, skipped_checks)
 
         if isinstance(observed_result, tuple):
             observed_df, observation = observed_result
@@ -253,8 +368,11 @@ class DQEngineCore(DQEngineCoreBase):
         errors_col = self._result_column_names[ColumnArguments.ERRORS]
         warnings_col = self._result_column_names[ColumnArguments.WARNINGS]
         info_col = self._result_column_names[ColumnArguments.INFO]
+        result_cols = [errors_col, warnings_col, info_col]
+        if self._checks_log_location:
+            result_cols.append(self._result_column_names[ColumnArguments.CHECKS])
 
-        result_collisions = [col for col in (errors_col, warnings_col, info_col) if col in df_columns]
+        result_collisions = [col for col in result_cols if col in df_columns]
         if result_collisions:
             collisions_str = ", ".join(result_collisions)
             raise InvalidParameterError(
@@ -286,8 +404,12 @@ class DQEngineCore(DQEngineCoreBase):
                 "All elements in the 'checks' list must be instances of DQRule. Use 'apply_checks_by_metadata_and_split' to pass checks as list of dicts instead."
             )
 
-        observed_result = self.apply_checks(df, checks, ref_dfs)
+        return self._split(self._apply_checks(df, checks, ref_dfs))
 
+    def _split(
+        self, observed_result: DataFrame | tuple[DataFrame, Observation]
+    ) -> tuple[DataFrame, DataFrame] | tuple[DataFrame, DataFrame, Observation]:
+        """Split checked results into valid and invalid DataFrames, passing through the Observation if any."""
         if isinstance(observed_result, tuple):
             checked_df, observation = observed_result
             good_df = self.get_valid(checked_df)
@@ -322,7 +444,7 @@ class DQEngineCore(DQEngineCoreBase):
             summary metrics. Summary metrics are returned by any `DQEngine` with an `observer` specified.
         """
         dq_rule_checks = deserialize_checks(checks, custom_check_functions)
-        return self.apply_checks(df, dq_rule_checks, ref_dfs)
+        return self._apply_checks(df, dq_rule_checks, ref_dfs, checks, custom_check_functions)
 
     def apply_checks_by_metadata_and_split(
         self,
@@ -354,7 +476,9 @@ class DQEngineCore(DQEngineCoreBase):
         """
         dq_rule_checks = deserialize_checks(checks, custom_check_functions)
 
-        good_df, bad_df, *observations = self.apply_checks_and_split(df, dq_rule_checks, ref_dfs)
+        good_df, bad_df, *observations = self._split(
+            self._apply_checks(df, dq_rule_checks, ref_dfs, checks, custom_check_functions)
+        )
 
         # An observation is only returned when observe() was actually wired (an observer is set and we
         # are not inside a Spark Declarative Pipeline, where it is skipped). Key off the returned shape
@@ -430,9 +554,14 @@ class DQEngineCore(DQEngineCoreBase):
             df: Input DataFrame.
 
         Returns:
-            DataFrame with warning rows but without the results columns.
+            DataFrame with warning rows but without the results columns. When the checks log is enabled, the
+            warnings and checks columns are kept, so the checks that passed on each row can be told apart from
+            those that raised a warning.
         """
-        return df.where(F.col(self._result_column_names[ColumnArguments.ERRORS]).isNull()).drop(
+        valid_df = df.where(F.col(self._result_column_names[ColumnArguments.ERRORS]).isNull())
+        if self._checks_log_location:
+            return valid_df.drop(self._result_column_names[ColumnArguments.ERRORS])
+        return valid_df.drop(
             self._result_column_names[ColumnArguments.ERRORS], self._result_column_names[ColumnArguments.WARNINGS]
         )
 
@@ -586,11 +715,165 @@ class DQEngineCore(DQEngineCoreBase):
         Returns:
             DataFrame with checks
         """
-        return df.select(
-            "*",
+        result_columns = [
             F.lit(None).cast(dq_result_schema).alias(self._result_column_names[ColumnArguments.ERRORS]),
             F.lit(None).cast(dq_result_schema).alias(self._result_column_names[ColumnArguments.WARNINGS]),
+        ]
+        if self._checks_log_location:
+            # Nothing is logged for an empty rule set, so the fingerprint is null and no check is listed.
+            result_columns.append(
+                self._build_checks_column(None, []).alias(self._result_column_names[ColumnArguments.CHECKS])
+            )
+        return df.select("*", *result_columns)
+
+    def _build_checks_column(self, rule_set_fingerprint: str | None, not_applied_exprs: list[Column | None]) -> Column:
+        """Build the *_checks* column recording the rule set applied to each row.
+
+        Each field is cast to its type from *dq_checks_schema* and the struct is built from those fields, with
+        no struct-to-struct cast (which Photon does not support for struct expressions).
+
+        Args:
+            rule_set_fingerprint: Fingerprint of the applied rule set, or None for an empty rule set.
+            not_applied_exprs: One expression per check, evaluating to the check's fingerprint when the check did
+                not apply to the row and to null otherwise (None for checks that apply to every row).
+
+        Returns:
+            Struct column with *run_id*, *rule_set_fingerprint* and the sorted *not_applied* fingerprints.
+        """
+        exprs = [expr for expr in not_applied_exprs if expr is not None]
+        not_applied = F.array_sort(F.array_distinct(F.array_compact(F.array(*exprs)))) if exprs else F.array()
+        values = {
+            "run_id": F.lit(self.run_id),
+            "rule_set_fingerprint": F.lit(rule_set_fingerprint),
+            "not_applied": not_applied,
+        }
+        checks_struct = F.struct(
+            *[values[field.name].cast(field.dataType).alias(field.name) for field in dq_checks_schema]
         )
+        # The typed null branch widens the field nullability of the literal struct to that of dq_checks_schema,
+        # so the column type is the same whether or not a rule set was applied.
+        return F.when(F.lit(True), checks_struct).otherwise(F.lit(None).cast(dq_checks_schema))
+
+    def _ensure_checks_logged(
+        self,
+        checks: list[DQRule],
+        rule_set_fingerprint: str,
+        source_checks: list[dict] | None,
+        custom_check_functions: dict[str, Callable] | None,
+    ) -> None:
+        """Make sure the rule set is in the checks log before results referencing it are produced.
+
+        Args:
+            checks: The checks being applied.
+            rule_set_fingerprint: Fingerprint of *checks*.
+            source_checks: The metadata the checks were deserialized from, if any.
+            custom_check_functions: Custom check functions used by *source_checks*.
+        """
+        with self._logged_rule_sets_lock:
+            if rule_set_fingerprint in self._logged_rule_sets:
+                return
+
+        self._write_checks_log(checks, rule_set_fingerprint, "default", source_checks, custom_check_functions)
+
+    def _write_checks_log(
+        self,
+        checks: list[DQRule],
+        rule_set_fingerprint: str,
+        run_config_name: str,
+        source_checks: list[dict] | None,
+        custom_check_functions: dict[str, Callable] | None,
+    ) -> None:
+        """Save the rule set to the checks log (an append-only checks table) unless this engine already did.
+
+        Args:
+            checks: The checks being logged.
+            rule_set_fingerprint: Fingerprint of *checks*.
+            run_config_name: Run configuration name to store the rule set under.
+            source_checks: The metadata the checks were deserialized from; logged as written when given.
+                Otherwise the checks are serialized.
+            custom_check_functions: Custom check functions used by *source_checks*.
+
+        Raises:
+            InvalidCheckError: If the definitions to log do not reproduce *rule_set_fingerprint*.
+            InvalidConfigError: Inside a Spark Declarative Pipeline, if the checks log table does not exist.
+        """
+        assert self._checks_log_location  # only called when the checks log is enabled
+        with self._logged_rule_sets_lock:
+            if run_config_name in self._logged_rule_sets.get(rule_set_fingerprint, set()):
+                return
+
+            storage_handler = TableChecksStorageHandler(self.ws, self.spark)
+            # A pipeline can append to an existing Delta table but must not create one, so the log table
+            # (created append-only by the first write outside a pipeline) has to exist already.
+            if is_dlt_pipeline(self.spark) and not storage_handler.table_exists(self._checks_log_location):
+                raise InvalidConfigError(
+                    f"The checks log table '{self._checks_log_location}' does not exist. Inside a Spark "
+                    "Declarative Pipeline it is not created automatically: create it first, e.g. by calling "
+                    "DQEngine.log_checks once outside the pipeline."
+                )
+
+            if source_checks is None:
+                display_text_rules = sorted({check.name for check in checks if _has_complex_column_argument(check)})
+                if display_text_rules:
+                    logger.warning(
+                        "Checks with Column arguments that are not simple column references are logged with the "
+                        "display text of those arguments, so loading them from the checks log does not rebuild "
+                        f"the same expressions: {sanitize_for_log(', '.join(display_text_rules))}"
+                    )
+                # serialize_checks writes Decimal values as markers, which saving checks does not accept
+                checks_to_log = ChecksNormalizer.denormalize(serialize_checks(checks))
+                log_check_functions = {check.check_func.__name__: check.check_func for check in checks}
+                # Metadata checks reproduce their fingerprint by construction; serialized checks are verified so
+                # that a lossy serialization can never produce a log entry the results cannot be joined to.
+                if compute_rule_set_fingerprint_by_metadata(checks_to_log, log_check_functions) != rule_set_fingerprint:
+                    raise InvalidCheckError(
+                        "The checks cannot be recorded in the checks log: their serialized definitions do not "
+                        "reproduce the applied rule set fingerprint. Define the checks as metadata instead."
+                    )
+            else:
+                checks_to_log = source_checks
+                log_check_functions = custom_check_functions or {}
+
+            storage_handler.save(
+                checks_to_log,
+                TableChecksStorageConfig(
+                    location=self._checks_log_location,
+                    run_config_name=run_config_name,
+                    mode="append",
+                    append_only=True,
+                ),
+                log_check_functions,
+            )
+            self._logged_rule_sets.setdefault(rule_set_fingerprint, set()).add(run_config_name)
+
+    @staticmethod
+    def _validate_unique_rule_fingerprints(checks: list[DQRule]) -> None:
+        """Reject rule sets where a check with a complex Column argument shares its fingerprint with another check.
+
+        Complex Column arguments are fingerprinted by their display text, so two different expressions (e.g.
+        *F.lit("k")* and *F.col("k")*) can produce the same fingerprint and could not be told apart in the
+        checks log or the result columns. Identical checks without complex Column arguments behave the same,
+        so they are allowed.
+
+        Args:
+            checks: The checks being applied or logged.
+
+        Raises:
+            InvalidCheckError: If such a fingerprint collision is found.
+        """
+        counts = Counter(check.rule_fingerprint for check in checks)
+        colliding = sorted(
+            {
+                check.name
+                for check in checks
+                if counts[check.rule_fingerprint] > 1 and _has_complex_column_argument(check)
+            }
+        )
+        if colliding:
+            raise InvalidCheckError(
+                "Checks with complex Column arguments share a rule fingerprint and cannot be told apart in the "
+                f"checks log: {sanitize_for_log(', '.join(colliding))}. Give each of these checks a distinct 'name'."
+            )
 
     def _create_results_array(
         self,
@@ -743,6 +1026,35 @@ class DQEngineCore(DQEngineCoreBase):
             return df.observe(self.observer.id, *metric_exprs), observation
 
         return df.observe(observation, *metric_exprs), observation
+
+
+def _build_not_applied_expr(check: DQRule, skipped_checks: set[str]) -> Column | None:
+    """
+    Return an expression evaluating to the fingerprint of *check* on rows it did not apply to, and to null otherwise.
+
+    A skipped check applies to no row. A filtered check does not apply where its filter is false or null, which
+    mirrors the *checked_count* summary metric. Returns None for a check that applies to every row.
+    """
+    if check.rule_fingerprint in skipped_checks:
+        return F.lit(check.rule_fingerprint)
+    if check.effective_filter:
+        applies = F.coalesce(safe_filter_expr(check.effective_filter), F.lit(False))
+        return F.when(~applies, F.lit(check.rule_fingerprint))
+    return None
+
+
+def _has_complex_column_argument(check: DQRule) -> bool:
+    """
+    Return True if *check* has a Column argument that is not a simple column reference.
+
+    Such arguments cannot be serialized exactly: their display text is used for the fingerprint and metadata.
+    """
+    args, kwargs = check.prepare_check_func_args_and_kwargs()
+    try:
+        normalize_bound_args([*args, *kwargs.values()])
+    except InvalidParameterError:
+        return True
+    return False
 
 
 def _keeps_input_rows(check: DQRule) -> bool:
@@ -958,6 +1270,49 @@ class DQEngine(DQEngineBase):
         return self._engine.apply_checks_by_metadata_and_split(
             df=df, checks=checks, custom_check_functions=custom_check_functions, ref_dfs=ref_dfs
         )
+
+    @telemetry_logger("engine", "log_checks")
+    def log_checks(
+        self,
+        checks: list[DQRule] | list[dict],
+        run_config_name: str = "default",
+        custom_check_functions: dict[str, Callable] | None = None,
+    ) -> str:
+        """Save a rule set to the checks log (*ExtraParams.checks_log_location*).
+
+        The engine logs every rule set it applies, so calling this method is only needed to log a rule set
+        under a specific run configuration name, or to create the checks log table before checks are applied
+        inside a Spark Declarative Pipeline (which can append to the table but does not create it). Checks given
+        as metadata are logged exactly as written; *DQRule* objects are logged via *serialize_checks*.
+
+        Args:
+            checks: Checks to log, either as *DQRule* objects or as metadata (list of dicts).
+            run_config_name: Run configuration name to store the rule set under (use "default" if not provided).
+            custom_check_functions: Optional dictionary with custom check functions used by metadata checks
+                (e.g., *globals()* of the calling module).
+
+        Returns:
+            The rule set fingerprint of the logged checks.
+
+        Raises:
+            InvalidConfigError: If the checks log is not enabled.
+            InvalidParameterError: If *checks* is empty.
+            InvalidCheckError: If any of the checks are invalid.
+        """
+        return self._engine.log_checks(checks, run_config_name, custom_check_functions)
+
+    def _log_checks_for_run(
+        self,
+        checks: list[DQRule] | list[dict],
+        run_config_name: str,
+        custom_check_functions: dict[str, Callable] | None = None,
+    ) -> None:
+        """Log the rule set under *run_config_name* before it is applied, when the checks log is enabled.
+
+        The engine would otherwise log it under the "default" run configuration name when applying it.
+        """
+        if self._engine.checks_log_location and checks:
+            self._engine.log_checks(checks, run_config_name, custom_check_functions)
 
     @telemetry_logger("engine", "apply_checks_and_split")
     def _apply_checks_for_split(
@@ -1288,7 +1643,11 @@ class DQEngine(DQEngineBase):
             )
             # raise an error if checks location not found
             checks_metadata = storage_handler.load(storage_config)
+            # log the loaded definitions as written, rather than serializing the deserialized checks
+            self._log_checks_for_run(checks_metadata, run_config_name)
             checks = deserialize_checks(checks_metadata)
+        elif checks:
+            self._log_checks_for_run(checks, run_config_name)
 
         df = read_input_data(self.spark, input_config)
 
@@ -1428,6 +1787,9 @@ class DQEngine(DQEngineBase):
             # raise an error if checks location not found
             checks = storage_handler.load(storage_config)
 
+        assert checks is not None  # guaranteed: either provided or loaded from checks_location above
+        self._log_checks_for_run(checks, run_config_name, custom_check_functions)
+
         df = read_input_data(self.spark, input_config)
 
         batch_observation = None
@@ -1461,7 +1823,6 @@ class DQEngine(DQEngineBase):
                 metrics_only_df = checked_df
             target_streaming_query = output_streaming_query
 
-        assert checks is not None  # guaranteed: either provided or loaded from checks_location above
         rule_set_fingerprint = (
             compute_rule_set_fingerprint_by_metadata(checks, custom_check_functions) if checks else None
         )
@@ -1684,7 +2045,8 @@ class DQEngine(DQEngineBase):
             df: Input DataFrame.
 
         Returns:
-            DataFrame with warning rows but without the results columns.
+            DataFrame with warning rows but without the results columns. When the checks log is enabled, the
+            warnings and checks columns are kept.
         """
         return self._engine.get_valid(df)
 
@@ -2283,6 +2645,7 @@ class DQEngine(DQEngineBase):
             custom_check_functions=custom_check_functions,
             ref_dfs=ref_dfs,
             checks_location=storage_config.location,
+            run_config_name=run_config.name,
         )
 
     def _engine_for_run_config(self, run_config: RunConfig) -> "DQEngine":

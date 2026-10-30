@@ -5,7 +5,7 @@ sidebar_position: 313
 import Admonition from '@theme/Admonition';
 import Tabs from '@theme/Tabs';
 import TabItem from '@theme/TabItem';
-import { AvailableSinceVersion, FeatureTags } from '@site/src/components/FeatureTags';
+import { FeatureLifecycleStage, AvailableSinceVersion, FeatureTags } from '@site/src/components/FeatureTags';
 
 
 # Additional Configuration
@@ -94,6 +94,7 @@ You can customize the names of these result columns by specifying extra paramete
 | `_errors` | Array of critical quality check failures | `errors` |
 | `_warnings` | Array of warning-level quality check issues | `warnings` |
 | `_dq_info` | Structured metadata produced by certain dataset-level checks (e.g., row anomaly detection) | `info` |
+| `_checks` | Rule set applied to the row and the checks that did not apply to it (only when a [checks log](#recording-checks-per-row-checks-log) is configured) | `checks` |
 
 <Tabs>
   <TabItem value="Python" label="Python" default>
@@ -231,6 +232,61 @@ Variable substitution is not currently supported in DQX installable workflows. V
 
 Variable substitution is only available when defining checks declaratively (as dictionaries or in files/tables). It is not supported when using DQX classes (e.g., `DQRowRule`) directly.
 </Admonition> 
+
+## Recording checks per row (checks log)
+
+<FeatureTags>
+  <FeatureLifecycleStage stage="beta" heading={false} />
+  <AvailableSinceVersion productName="DQX" version="0.18.0" heading={false} />
+</FeatureTags>
+
+By default, a row only carries the checks that failed (in `_errors` and `_warnings`). A row without entries may have passed every check, or some checks may not have applied to it because of their filter. If you need to show, for each row, exactly which checks passed and which failed, configure a checks log with `checks_log_location`. This does two things:
+
+- **Logs every rule set the engine applies** to an append-only checks table at `checks_log_location`. The log is an ordinary [checks table](/docs/reference/table_schemas#checks-table-schema): it holds the check definitions as written (from a file, a table, or a list of dicts), so `load_checks` can reload the exact rules of any past run, even after the original checks file or table has changed. The table is created with the `delta.appendOnly` property, so logged rule sets cannot be changed or deleted.
+- **Adds a `_checks` column** to the results, with the run id, the `rule_set_fingerprint` of the applied rule set, and `not_applied`: the fingerprints of the checks whose filter was false or null for the row, plus checks skipped for the whole run. See [the `_checks` column](/docs/reference/table_schemas#checks-column-_checks).
+
+Every check of the logged rule set that is not in `not_applied` was applied to the row: it failed if it appears in `_errors` or `_warnings`, and passed otherwise. The [per-row check status](/docs/reference/query_results_cookbook#per-row-check-status) recipe decodes this into one status per row and check.
+
+<Tabs>
+  <TabItem value="Python" label="Python" default>
+    ```python
+    from databricks.sdk import WorkspaceClient
+    from databricks.labs.dqx.engine import DQEngine
+    from databricks.labs.dqx.config import ExtraParams, TableChecksStorageConfig
+
+    extra_parameters = ExtraParams(checks_log_location="catalog.schema.checks_log")
+    dq_engine = DQEngine(WorkspaceClient(), extra_params=extra_parameters)
+
+    # the rule set is logged (once) before the results are produced
+    checked_df = dq_engine.apply_checks_by_metadata(input_df, checks)
+    # with split, the valid DataFrame keeps _warnings and _checks, so warned checks can be told apart from passed ones
+    valid_df, invalid_df = dq_engine.apply_checks_by_metadata_and_split(input_df, checks)
+
+    # reload the rules of a past run from the log
+    rule_set_fingerprint = checked_df.select("_checks.rule_set_fingerprint").first()[0]
+    logged_checks = dq_engine.load_checks(
+      TableChecksStorageConfig(location="catalog.schema.checks_log", rule_set_fingerprint=rule_set_fingerprint)
+    )
+    ```
+  </TabItem>
+  <TabItem value="Workflows" label="Workflows">
+    Set the following field in the [configuration file](/docs/installation/#configuration-file) to record checks per row when using DQX workflows. Rule sets are logged under the name of their run configuration.
+    ```yaml
+    extra_params:
+      checks_log_location: catalog.schema.checks_log
+    ```
+  </TabItem>
+</Tabs>
+
+Things to know:
+
+- **Run configuration name**: checks applied with `apply_checks_by_metadata_and_save_in_table`, `apply_checks_and_save_in_table` or a workflow are logged under their `run_config_name`; other checks are logged under `default`. Use `dq_engine.log_checks(checks, run_config_name=...)` to log a rule set under a specific name. The same rule set may be logged under several names, so deduplicate by `rule_set_fingerprint` when joining (the cookbook recipe does).
+- **Cost**: the first time an engine applies a rule set, it checks the log and writes the rule set if it is new, before returning the results. Later applies of the same rule set by that engine skip this.
+- **Rules built in code**: checks passed as `DQRule` objects have no source definition, so they are logged via `serialize_checks`. Column arguments that are not simple column references (e.g. `F.col("a") + 1`) are logged as their display text and a warning is shown; such checks cannot be reloaded exactly from the log. Two such checks can produce the same fingerprint (e.g. `F.try_element_at(F.col("m"), F.lit("k"))` and `F.try_element_at(F.col("m"), F.col("k"))`); DQX then raises an error asking you to give each a distinct `name`. Define checks as metadata to avoid both limitations.
+- **Spark Declarative Pipelines**: a pipeline can append to the checks log but does not create it. Create the log table once before running the pipeline, e.g. by calling `dq_engine.log_checks(checks)` in a notebook or job task.
+- **`user_metadata` changes**: `user_metadata` is not part of the fingerprint, so a rule set that only changes `user_metadata` is not logged again.
+- **Retention**: rows cannot be deleted from an append-only table. To apply a retention policy, remove the `delta.appendOnly` table property first.
+- **Size**: `_checks` adds about 24 bytes per row when no checks are filtered. Each filtered check that does not apply to a row adds its 64-character fingerprint to that row, so a rule set where many filtered checks rarely match grows the column the most.
 
 ## Overwriting run metadata
 

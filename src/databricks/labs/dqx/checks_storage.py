@@ -416,7 +416,7 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
             NotFound: if the table does not exist in the workspace
         """
         logger.info(f"Loading quality rules (checks) from table '{config.location}'")
-        if not self._table_exists(config.location):
+        if not self.table_exists(config.location):
             raise NotFound(f"Checks table '{config.location}' does not exist in the workspace")
 
         rules_df = self.spark.read.table(config.location)
@@ -461,6 +461,9 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
             - **append**: If the fingerprint differs, appends the new checks as additional rows for this
               run_config_name (multiple versions accumulate). If the fingerprint matches, no write is performed.
 
+            Append-only: With *config.append_only*, a table created by this save gets the *delta.appendOnly*
+            table property. An existing table is left unchanged.
+
             Backfill: If the rule set is already stored but some of its rows predate the
             *expanded_rule_fingerprints* column, that column alone is filled in for those rows.
 
@@ -494,7 +497,8 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
         )
 
         # Skip save if rule_set_fingerprint already exists in existing table
-        if self._table_exists(config.location):
+        existing_table = self.table_exists(config.location)
+        if existing_table:
             existing_df = self.spark.read.table(config.location)
             columns_added = self._ensure_columns(config.location, existing_df)
             if columns_added:
@@ -516,6 +520,12 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
             predicate = f"run_config_name = '{config.run_config_name}'"
             writer = writer.option("replaceWhere", predicate)
         writer.saveAsTable(config.location, mode=config.mode)
+
+        if config.append_only and not existing_table:
+            self.spark.sql(
+                f"ALTER TABLE {_quote_table_name(config.location)} SET TBLPROPERTIES ('delta.appendOnly' = 'true')"
+            )
+            logger.info(f"Created append-only checks table '{config.location}'.")
 
     def _backfill_expanded_rule_fingerprints(
         self,
@@ -560,7 +570,7 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
             self.spark.sql(f"DROP VIEW IF EXISTS {source_view}")
         logger.info(f"Backfilled expanded_rule_fingerprints for rule_set_fingerprint '{rule_set_fingerprint}'.")
 
-    def _table_exists(self, location: str) -> bool:
+    def table_exists(self, location: str) -> bool:
         """Check if a Delta table exists in the workspace.
 
         Args:

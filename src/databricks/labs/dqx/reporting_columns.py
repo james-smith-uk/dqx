@@ -9,6 +9,7 @@ class DefaultColumnNames(Enum):
     ERRORS = "_errors"
     WARNINGS = "_warnings"
     INFO = "_dq_info"
+    CHECKS = "_checks"
 
 
 class ColumnArguments(Enum):
@@ -17,6 +18,7 @@ class ColumnArguments(Enum):
     ERRORS = "errors"
     WARNINGS = "warnings"
     INFO = "info"
+    CHECKS = "checks"
 
 
 def merge_info_columns(dest_name: str, df: DataFrame, info_col_names: list[str] | None = None) -> DataFrame:
