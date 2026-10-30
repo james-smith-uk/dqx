@@ -407,3 +407,36 @@ def test_apply_checks_by_metadata_for_each_column_fingerprint_consistency(ws, sp
         f"  Fingerprint from deserialized rules: {fingerprint_from_expanded!r}\n"
         "These must be equal so that summary metrics and row-level results can be correlated."
     )
+
+
+def test_for_each_column_results_join_to_stored_check_via_expanded_fingerprints(ws, spark):
+    """Results of a for_each_column check join back to its compact stored row via expanded_rule_fingerprints."""
+    dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    test_df = spark.createDataFrame([[None, None, 1], [1, None, None]], SCHEMA)
+    checks = [
+        {
+            "name": "not_null",
+            "criticality": "error",
+            "filter": "c IS NOT NULL OR a IS NOT NULL",
+            "check": {"function": "is_not_null", "for_each_column": ["a", "b"]},
+        },
+        {"criticality": "warn", "check": {"function": "is_not_null", "arguments": {"column": "c"}}},
+    ]
+
+    result = dq_engine.apply_checks_by_metadata(test_df, checks)
+    stored = DataFrameConverter.to_dataframe(spark, checks)
+
+    failures = result.select(F.explode("_errors.rule_fingerprint").alias("rule_fingerprint")).unionByName(
+        result.select(F.explode("_warnings.rule_fingerprint").alias("rule_fingerprint"))
+    )
+    stored_by_rule = stored.select(
+        F.col("check.function").alias("function"),
+        F.col("rule_fingerprint").alias("compact_rule_fingerprint"),
+        F.explode("expanded_rule_fingerprints").alias("rule_fingerprint"),
+    )
+    joined = failures.join(stored_by_rule, "rule_fingerprint", "left")
+
+    assert failures.count() == 4  # a and b null in row 1, b null in row 2, c null in row 2
+    assert joined.where("compact_rule_fingerprint IS NULL").count() == 0
+    stored_compact = {row.rule_fingerprint for row in stored.collect()}
+    assert {row.compact_rule_fingerprint for row in joined.collect()} == stored_compact
