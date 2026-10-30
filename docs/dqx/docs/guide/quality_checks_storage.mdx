@@ -91,7 +91,9 @@ You can also store them directly in a Delta table using Spark DataFrame API.
 
 When using `DQEngine.save_checks`, you can pass checks with `for_each_column`; DQX stores them in compact format (one row per check). When creating a DataFrame manually (without DQX), you can use either compact format (one row with `for_each_column`) or expanded format (one row per column).
 
-The minimal schema for manual creation has no versioning columns. When you first use `DQEngine.save_checks`, DQX adds `created_at`, `rule_fingerprint`, and `rule_set_fingerprint` via `ALTER TABLE` if missing.
+The minimal schema for manual creation has no versioning columns. When you first use `DQEngine.save_checks`, DQX adds `created_at`, `rule_fingerprint`, `rule_set_fingerprint`, `message_expr` and `expanded_rule_fingerprints` via `ALTER TABLE` if missing.
+
+`expanded_rule_fingerprints` lists the `rule_fingerprint` of each rule a stored check expands into when applied (one per column for a `for_each_column` check), so results can be joined back to the compact row. When you save a rule set that is already stored but whose rows predate this column, DQX fills in `expanded_rule_fingerprints` for those rows without writing the rule set again.
 
 <Tabs>
   <TabItem value="Python" label="Python" default>
@@ -100,7 +102,8 @@ The minimal schema for manual creation has no versioning columns. When you first
     from databricks.sdk import WorkspaceClient
     from databricks.labs.dqx.config import TableChecksStorageConfig
 
-    # Minimal schema (no versioning columns). DQX adds created_at, rule_fingerprint, rule_set_fingerprint when saving.
+    # Minimal schema (no versioning columns). DQX adds the versioning, message_expr and
+    # expanded_rule_fingerprints columns when saving.
     schema = (
       "name STRING, "
       "criticality STRING, "

@@ -947,3 +947,52 @@ def test_save_and_load_checks_from_table_with_variables(ws, make_schema, make_ra
 
     # Verify the resolved checks are valid and can be applied end-to-end
     assert not engine.validate_checks(loaded).has_errors
+
+
+def _expected_expanded_rule_fingerprints(checks: list[dict]) -> list[list[str]]:
+    return [DataFrameConverter.resolve_expanded_rule_fingerprints(check) for check in checks]
+
+
+def test_save_checks_stores_expanded_rule_fingerprints(ws, make_schema, make_random, spark):
+    """Each stored row carries the fingerprints of the rules it expands into; loading is unchanged."""
+    catalog_name = TEST_CATALOG
+    schema_name = make_schema(catalog_name=catalog_name).name
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    engine = DQEngine(ws, spark)
+
+    engine.save_checks(INPUT_CHECKS, config=TableChecksStorageConfig(location=table_name))
+
+    rows = spark.read.table(table_name).collect()
+    by_name = {row.name: row for row in rows}
+    assert len(rows) == len(INPUT_CHECKS)
+    for_each_row = next(row for row in rows if row.check["for_each_column"])
+    assert for_each_row.expanded_rule_fingerprints == _expected_expanded_rule_fingerprints(INPUT_CHECKS[:1])[0]
+    assert len(for_each_row.expanded_rule_fingerprints) == 2
+    plain_row = by_name["column_in_list"]
+    assert plain_row.expanded_rule_fingerprints == [plain_row.rule_fingerprint]
+    assert engine.load_checks(config=TableChecksStorageConfig(location=table_name)) == EXPECTED_CHECKS_FROM_TABLE_LOAD
+
+
+def test_save_backfills_expanded_rule_fingerprints_of_existing_rule_set(ws, make_schema, make_random, spark):
+    """A rule set stored before expanded_rule_fingerprints existed gets the column added and filled on re-save."""
+    catalog_name = TEST_CATALOG
+    schema_name = make_schema(catalog_name=catalog_name).name
+    table_name = f"{catalog_name}.{schema_name}.t{make_random(10).lower()}"
+    # versioned table from before the expanded_rule_fingerprints column was added
+    DataFrameConverter.to_dataframe(spark, INPUT_CHECKS).drop("expanded_rule_fingerprints").write.saveAsTable(
+        table_name
+    )
+    engine = DQEngine(ws, spark)
+
+    engine.save_checks(INPUT_CHECKS, config=TableChecksStorageConfig(location=table_name, mode="append"))
+
+    saved_df = spark.read.table(table_name)
+    assert saved_df.count() == len(INPUT_CHECKS)  # the rule set is not written again
+    expected = {
+        row.rule_fingerprint: fingerprints
+        for row, fingerprints in zip(
+            DataFrameConverter.to_dataframe(spark, INPUT_CHECKS).collect(),
+            _expected_expanded_rule_fingerprints(INPUT_CHECKS),
+        )
+    }
+    assert {row.rule_fingerprint: row.expanded_rule_fingerprints for row in saved_df.collect()} == expected

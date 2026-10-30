@@ -1231,7 +1231,7 @@ The `results_df` will contain the following columns:
 DQX provides full traceability across all layers:
 1. **Summary table → checks table**: Use `checks_location` and `rule_set_fingerprint` from the summary table to load the exact rule set from the checks table and see which rules were applied for that run.
 2. **Summary table → row-level results**: Use `run_id` from the summary table to filter the output or quarantine table and drill down to which rows failed which checks.
-3. **Row-level results → checks table**: Use `rule_fingerprint` and `rule_set_fingerprint` from each result row to join with the checks table and retrieve the exact check definition (function, arguments, filter, etc.) for that failure.
+3. **Row-level results → checks table**: Use `rule_fingerprint` and `rule_set_fingerprint` from each result row to join with the checks table and retrieve the exact check definition (function, arguments, filter, etc.) for that failure. A `for_each_column` check is stored as one row but produces one result per column; join on the exploded `expanded_rule_fingerprints` column so those results match too.
 
 The example below shows how to get rule definitions for failed checks using detailed results and the checks table.
 DQX automatically generates rule and rule set fingerprints to make this possible. The fingerprints in the detailed results match those stored in the summary metrics table and the checks table.
@@ -1245,6 +1245,8 @@ from pyspark.sql import functions as F
 checks_table = "main.default.dqx_checks_table"
 run_config_name = "main.default.input_table"
 
+# A for_each_column check is stored as one row that expands into one rule per column when applied;
+# expanded_rule_fingerprints holds the fingerprint of each expanded rule (one element for other checks).
 checks_df = spark.table(checks_table).filter(
     F.col("run_config_name") == run_config_name
 ).select(
@@ -1252,7 +1254,7 @@ checks_df = spark.table(checks_table).filter(
     F.col("criticality").alias("check_criticality"),
     F.col("check").alias("check_definition"),
     F.col("filter").alias("check_filter"),
-    F.col("rule_fingerprint"),
+    F.explode("expanded_rule_fingerprints").alias("rule_fingerprint"),
     F.col("rule_set_fingerprint"),
   )
 

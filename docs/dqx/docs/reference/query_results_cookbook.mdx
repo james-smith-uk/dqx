@@ -241,7 +241,7 @@ Start by getting a `run_id` from the summary table. Every recipe that takes a `r
 **Returns**: One row per error, each with its check function, arguments, filter, and criticality from the checks table.
 
 <Admonition type="note" title="for_each_column rules">
-Rules defined with `for_each_column` are stored as a single row in the checks table but expand into one error per column at runtime, each with its own `rule_fingerprint`. These per-column fingerprints do not match the parent row in the checks table, so the joins below will not return those rules. To find the originating rule, list all active rules for the run with [Recipe 6](#6-which-rules-were-applied-in-a-run), look for the ones where `check.for_each_column IS NOT NULL`, and match them by `check.function` and column membership.
+A rule defined with `for_each_column` is stored as a single row in the checks table but expands into one result per column at runtime, each with its own `rule_fingerprint`. The joins below match those results through the stored row's `expanded_rule_fingerprints` column. Rule sets saved by an older DQX version get this column filled in the next time they are saved with `DQEngine.save_checks`.
 </Admonition>
 
 <Tabs>
@@ -261,7 +261,7 @@ Rules defined with `for_each_column` are stored as a single row in the checks ta
       LATERAL VIEW explode(t._errors) AS errors
     ) e
     INNER JOIN catalog.schema.checks_table c
-      ON e.rule_fingerprint = c.rule_fingerprint
+      ON array_contains(c.expanded_rule_fingerprints, e.rule_fingerprint)
       AND e.rule_set_fingerprint = c.rule_set_fingerprint;
     ```
   </TabItem>
@@ -275,7 +275,10 @@ Rules defined with `for_each_column` are stored as a single row in the checks ta
       .select(F.expr("result.*"))
     )
 
-    checks_df = spark.table("catalog.schema.checks_table")
+    # one row per expanded rule, so results of for_each_column rules match their stored row
+    checks_df = spark.table("catalog.schema.checks_table").withColumn(
+      "rule_fingerprint", F.explode("expanded_rule_fingerprints")
+    )
     result_df = (
       errors_df.alias("e")
       .join(checks_df.alias("c"), on=["rule_fingerprint", "rule_set_fingerprint"])
@@ -418,11 +421,7 @@ If you also need the full check definition (function, arguments, filter), join t
 
 ### With Check Definitions
 
-**Returns**: One row per distinct failing check, with its function, arguments, and filter (`null` for `for_each_column` rules - see the note below).
-
-<Admonition type="note" title="for_each_column rules">
-Rules defined with `for_each_column` produce per-column errors with fingerprints that do not match the parent row in the checks table, so they join with `null` check columns. See the same note in [Recipe 3](#3-row-details) for how to recover the originating rule via [Recipe 6](#6-which-rules-were-applied-in-a-run).
-</Admonition>
+**Returns**: One row per distinct failing check, with its function, arguments, and filter. Results of `for_each_column` rules match their stored row through `expanded_rule_fingerprints` (see the note in [Recipe 3](#3-row-details)).
 
 <Tabs>
   <TabItem value="SQL" label="SQL" default>
@@ -440,7 +439,7 @@ Rules defined with `for_each_column` produce per-column errors with fingerprints
       WHERE errors.run_id = '<run_id>'
     ) e
     LEFT JOIN catalog.schema.checks_table c
-      ON e.rule_fingerprint = c.rule_fingerprint
+      ON array_contains(c.expanded_rule_fingerprints, e.rule_fingerprint)
       AND e.rule_set_fingerprint = c.rule_set_fingerprint;
     ```
   </TabItem>
@@ -455,7 +454,10 @@ Rules defined with `for_each_column` produce per-column errors with fingerprints
       .filter(F.col("run_id") == "<run_id>")
     )
 
-    checks_df = spark.table("catalog.schema.checks_table")
+    # one row per expanded rule, so results of for_each_column rules match their stored row
+    checks_df = spark.table("catalog.schema.checks_table").withColumn(
+      "rule_fingerprint", F.explode("expanded_rule_fingerprints")
+    )
     failed_checks_df = (
       errors_df
       .select(
