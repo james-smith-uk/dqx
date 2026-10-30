@@ -3,10 +3,12 @@ from .dq_info_schema import (
     dq_info_item_schema,
     register_dq_info_field,
 )
+from .dq_checks_schema import dq_checks_schema
 from .dq_result_schema import dq_result_schema
 
 __all__ = [
     "build_dq_info_struct",
+    "dq_checks_schema",
     "dq_info_item_schema",
     "dq_result_schema",
     "register_dq_info_field",

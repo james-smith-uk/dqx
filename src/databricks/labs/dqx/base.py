@@ -173,7 +173,8 @@ class DQEngineCoreBase(DQEngineBase):
             df: Input DataFrame.
 
         Returns:
-            DataFrame with warning rows but without the results columns.
+            DataFrame with warning rows but without the results columns. When the checks log is enabled, the
+            warnings and checks columns are kept.
         """
 
     @staticmethod

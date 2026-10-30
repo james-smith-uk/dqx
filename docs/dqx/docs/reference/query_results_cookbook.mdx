@@ -23,6 +23,7 @@ The examples below use these placeholder table names. Please replace them with y
 - `catalog.schema.output_table` - output table
 - `catalog.schema.quarantine_table` - quarantine table (when configured)
 - `catalog.schema.checks_table` - checks storage table
+- `catalog.schema.checks_log` - [checks log](/docs/guide/additional_configuration#recording-checks-per-row-checks-log) (when configured)
 - `catalog.schema.summary_metrics` - summary metrics table
 - `catalog.schema.my_table` - the input table being checked
 
@@ -48,6 +49,7 @@ Find what you already have in the table below, then jump to the recipe that uses
 | Failing check | The first run it appeared in | [10. First Failure per Check](#10-first-failure-per-check) |
 | Check name | All quarantine rows that failed that check | [11. All Failures per Check](#11-all-failures-per-check) |
 | Run or time window | Wide summary view with metrics as columns | [12. Summary Metrics Pivot](#12-summary-metrics-pivot) |
+| Any row (with a checks log) | Which checks passed, failed, or did not apply to it | [13. Per-Row Check Status](#per-row-check-status) |
 
 New to the tables? Start with **[Recipe 1 - A quick peek at each table](#1-a-quick-peek-at-each-table)** for orientation.
 
@@ -916,6 +918,94 @@ Then drill into a single check to get the failing rows. Replace `<your_check_nam
     ```
   </TabItem>
 </Tabs>
+
+## 13. Per-Row Check Status {#per-row-check-status}
+
+**Goal**: For each row, list every check of the applied rule set with its status: `passed`, `failed_error`, `failed_warning`, or `not_applied`.
+
+**When to use**: You need to prove which checks a row passed, not only which ones it failed. Requires a [checks log](/docs/guide/additional_configuration#recording-checks-per-row-checks-log), which adds the `_checks` column to the results.
+
+**Returns**: One row per input row and check. `for_each_column` identifies the column of an expanded `for_each_column` check (`null` for other checks).
+
+The `_checks` column holds the rule set fingerprint and the checks that did not apply to the row (filter false or null, or skipped for the run). Every other check of the rule set, as stored in the checks log, was applied: it failed if it appears in `_errors` or `_warnings`, and passed otherwise. Replace `id` with your table's row key; without a stable key you can still aggregate statuses, but not identify rows.
+
+<Tabs>
+  <TabItem value="SQL" label="SQL" default>
+    ```sql
+    WITH logged_rules AS (
+      -- DISTINCT: the same rule set may be logged under several run config names
+      SELECT DISTINCT
+        log.rule_set_fingerprint,
+        rule.rule_fingerprint,
+        log.name,
+        log.check.function AS function,
+        try_element_at(log.check.for_each_column, rule.pos + 1) AS for_each_column
+      FROM catalog.schema.checks_log AS log
+      LATERAL VIEW posexplode(log.expanded_rule_fingerprints) rule AS pos, rule_fingerprint
+    )
+    SELECT
+      results.id,
+      logged_rules.rule_fingerprint,
+      logged_rules.name,
+      logged_rules.function,
+      logged_rules.for_each_column,
+      CASE
+        WHEN array_contains(results._checks.not_applied, logged_rules.rule_fingerprint) THEN 'not_applied'
+        WHEN exists(results._errors, e -> e.rule_fingerprint = logged_rules.rule_fingerprint) THEN 'failed_error'
+        WHEN exists(results._warnings, w -> w.rule_fingerprint = logged_rules.rule_fingerprint) THEN 'failed_warning'
+        ELSE 'passed'
+      END AS status
+    FROM catalog.schema.output_table AS results
+    JOIN logged_rules ON logged_rules.rule_set_fingerprint = results._checks.rule_set_fingerprint;
+    ```
+  </TabItem>
+  <TabItem value="Python" label="Python">
+    ```python
+    import pyspark.sql.functions as F
+
+    logged_rules = (
+      spark.table("catalog.schema.checks_log")
+      .select(
+        "rule_set_fingerprint",
+        "name",
+        F.col("check.function").alias("function"),
+        F.col("check.for_each_column").alias("columns"),
+        F.posexplode("expanded_rule_fingerprints").alias("pos", "rule_fingerprint"),
+      )
+      .select(
+        "rule_set_fingerprint",
+        "rule_fingerprint",
+        "name",
+        "function",
+        F.try_element_at("columns", F.col("pos") + 1).alias("for_each_column"),
+      )
+      .distinct()  # the same rule set may be logged under several run config names
+    )
+
+    results = spark.table("catalog.schema.output_table")
+    rule = F.col("rule_fingerprint")
+    status_df = (
+      results.join(logged_rules, results["_checks.rule_set_fingerprint"] == logged_rules["rule_set_fingerprint"])
+      .select(
+        "id",
+        logged_rules["rule_fingerprint"],
+        "name",
+        "function",
+        "for_each_column",
+        F.when(F.array_contains("_checks.not_applied", rule), "not_applied")
+        .when(F.exists("_errors", lambda e: e["rule_fingerprint"] == rule), "failed_error")
+        .when(F.exists("_warnings", lambda w: w["rule_fingerprint"] == rule), "failed_warning")
+        .otherwise("passed")
+        .alias("status"),
+      )
+    )
+
+    display(status_df)
+    ```
+  </TabItem>
+</Tabs>
+
+With quarantine configured, run the query on the output and quarantine tables and combine the results with `UNION ALL`: the output table keeps `_warnings` and `_checks` when a checks log is enabled.
 
 ## DQX Studio quarantine records {#dqx-studio-quarantine-records}
 

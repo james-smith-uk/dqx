@@ -1,11 +1,14 @@
-from databricks.labs.dqx.engine import DQEngine
+from dataclasses import replace
 from datetime import datetime, timezone
+
+from databricks.labs.dqx.engine import DQEngine
 from databricks.labs.dqx.rule import DQRowRule, DQDatasetRule, DQForEachColRule
 from databricks.labs.dqx.config import ExtraParams
 import pytest
 import pyspark.sql.functions as F
 from databricks.labs.dqx import check_funcs
 from databricks.labs.dqx.geo import check_funcs as geo_check_funcs
+from tests.constants import TEST_CATALOG
 from tests.perf.conftest import DEFAULT_ROWS, DISTRIBUTION_VALUE_COUNT
 
 RUN_TIME = datetime(2025, 1, 1, 0, 0, 0, 0, tzinfo=timezone.utc)
@@ -16,6 +19,20 @@ EXPECTED_ROWS = DEFAULT_ROWS
 
 def test_benchmark_apply_checks_all_row_checks(benchmark, ws, all_row_checks, generated_df):
     dq_engine = DQEngine(workspace_client=ws, extra_params=EXTRA_PARAMS)
+    checked_df = dq_engine.apply_checks_by_metadata(generated_df, all_row_checks)
+    actual_count = benchmark(lambda: checked_df.count())
+    assert actual_count == EXPECTED_ROWS
+
+
+def test_benchmark_apply_checks_all_row_checks_with_checks_log(
+    benchmark, ws, all_row_checks, generated_df, make_schema, make_random
+):
+    schema_name = make_schema(catalog_name=TEST_CATALOG).name
+    extra_params = replace(
+        EXTRA_PARAMS, checks_log_location=f"{TEST_CATALOG}.{schema_name}.checks_log_{make_random(8).lower()}"
+    )
+    dq_engine = DQEngine(workspace_client=ws, extra_params=extra_params)
+    # the rule set is logged here, once; the benchmark measures computing the results with the _checks column
     checked_df = dq_engine.apply_checks_by_metadata(generated_df, all_row_checks)
     actual_count = benchmark(lambda: checked_df.count())
     assert actual_count == EXPECTED_ROWS

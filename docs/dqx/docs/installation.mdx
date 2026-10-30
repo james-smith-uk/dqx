@@ -249,6 +249,7 @@ extra_params:                       # <- optional extra parameters to pass to th
         warnings: dq_warnings       # <- default is "_warnings"
     user_metadata:
         custom_metadata: custom_value # <- optional user metadata to be added to the results
+    checks_log_location: catalog.schema.checks_log # <- optional append-only checks log; adds a _checks column to the results
 
 llm_config:                         # <- configuration for the llm-assisted features
   model:
