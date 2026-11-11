@@ -126,6 +126,7 @@ class DQEngineCore(DQEngineCoreBase):
         )
         self.engine_user_metadata = extra_params.user_metadata
         self.suppress_skipped = extra_params.suppress_skipped
+        self.skip_invalid_checks = extra_params.skip_invalid_checks
 
         self.observer = observer
         if self.observer:
@@ -188,7 +189,12 @@ class DQEngineCore(DQEngineCoreBase):
         rule_set_fingerprint = compute_rule_set_fingerprint(checks) if checks else None
         reference_cache: dict[tuple[str, str], DataFrame] = {}
         # One schema analysis validates the SQL expressions of every check that sees the input's rows and columns.
-        known_input = build_known_input_schema(df, _checks_validated_before_row_changes(error_checks + warning_checks))
+        # Without skipping, checks are not validated at all, so there is nothing to resolve up front.
+        known_input = (
+            build_known_input_schema(df, _checks_validated_before_row_changes(error_checks + warning_checks))
+            if self.skip_invalid_checks
+            else None
+        )
         checks_before_row_changes = itertools.takewhile(_keeps_input_rows, error_checks + warning_checks)
         input_managers = {
             id(check): DQRuleManager(
@@ -200,6 +206,7 @@ class DQEngineCore(DQEngineCoreBase):
                 run_time_overwrite=self.run_time_overwrite,
                 ref_dfs=ref_dfs,
                 suppress_skipped=self.suppress_skipped,
+                skip_invalid_checks=self.skip_invalid_checks,
                 rule_fingerprint=check.rule_fingerprint,
                 rule_set_fingerprint=rule_set_fingerprint,
                 input_df=df,
@@ -667,6 +674,7 @@ class DQEngineCore(DQEngineCoreBase):
                 run_time_overwrite=self.run_time_overwrite,
                 ref_dfs=ref_dfs,
                 suppress_skipped=self.suppress_skipped,
+                skip_invalid_checks=self.skip_invalid_checks,
                 rule_fingerprint=check.rule_fingerprint,
                 rule_set_fingerprint=rule_set_fingerprint,
                 input_df=check_input_df,
@@ -2125,6 +2133,7 @@ class DQEngine(DQEngineBase):
                 engine_user_metadata=self._engine.engine_user_metadata,
                 run_time_overwrite=self._engine.run_time_overwrite,
                 run_id=self._engine.run_id,
+                skip_invalid_checks=self._engine.skip_invalid_checks,
             ).is_skipped
         }
 

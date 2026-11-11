@@ -362,6 +362,7 @@ def test_extra_params_defaults():
     assert config.run_time_overwrite is None
     assert config.run_id_overwrite is None
     assert config.suppress_skipped is False
+    assert config.skip_invalid_checks is True
 
 
 def test_extra_params_custom_values():
@@ -380,6 +381,11 @@ def test_extra_params_custom_values():
 def test_extra_params_suppress_skipped():
     config = ExtraParams(suppress_skipped=True)
     assert config.suppress_skipped is True
+
+
+def test_extra_params_skip_invalid_checks_disabled():
+    config = ExtraParams(skip_invalid_checks=False)
+    assert config.skip_invalid_checks is False
 
 
 # Test WorkspaceConfig.as_dict()

@@ -324,6 +324,7 @@ class ExtraParams:
     run_time_overwrite: str | None = None
     run_id_overwrite: str | None = None
     suppress_skipped: bool = False
+    skip_invalid_checks: bool = True
     variables: dict[str, VariableValue] = field(default_factory=dict)
 
 

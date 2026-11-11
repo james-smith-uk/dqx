@@ -138,6 +138,8 @@ class DQRuleManager:
         input_df: Optional untouched input DataFrame (defaults to *df*). Check columns are validated against it,
             and dataset-level checks compute their aggregates from it.
         reference_cache: Optional per-run cache of compatible reference projections.
+        skip_invalid_checks: If False, the check is never validated against the DataFrame or skipped. An invalid
+            check then makes Spark reject the query when it is analyzed, and an unsafe filter raises an error.
         known_input: Optional schema facts of the untouched input that still hold for *df* and *input_df*, i.e. no
             earlier check may have changed the rows. Plain check column names and SQL expressions found there are
             accepted without a schema analysis (an RPC on Spark Connect); everything else is still resolved by Spark.
@@ -151,6 +153,7 @@ class DQRuleManager:
     run_id: str
     ref_dfs: dict[str, DataFrame] | None = None
     suppress_skipped: bool = False
+    skip_invalid_checks: bool = True
     rule_fingerprint: str | None = None
     rule_set_fingerprint: str | None = None
     input_df: DataFrame | None = None
@@ -264,6 +267,8 @@ class DQRuleManager:
         """
         Returns the message explaining why the check evaluation is skipped, or an empty string if it is not skipped.
         """
+        if not self.skip_invalid_checks:
+            return ""
         return self._get_invalid_cols_message()
 
     @cached_property
@@ -389,6 +394,8 @@ class DQRuleManager:
         """
         Returns True if the check evaluation is skipped, e.g. due to invalid columns, filter, or custom message.
         """
+        if not self.skip_invalid_checks:
+            return False
         return bool(
             self.has_invalid_columns
             or self.has_invalid_filter

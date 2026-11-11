@@ -1,9 +1,12 @@
 from unittest.mock import create_autospec, PropertyMock
 
+import pytest
+
 from pyspark.errors import AnalysisException
 from pyspark.sql import DataFrame, SparkSession
 
 from databricks.labs.dqx import check_funcs
+from databricks.labs.dqx.errors import UnsafeSqlQueryError
 from databricks.labs.dqx.executor import DQCheckResult
 from databricks.labs.dqx.manager import (
     DQRuleManager,
@@ -493,3 +496,44 @@ def test_build_known_input_schema_without_expressions_does_not_analyze():
 
     assert known_input == KnownInputSchema(columns=("id",))
     df_mock.select.assert_not_called()
+
+
+def _make_manager_without_skipping(df: DataFrame, check: DQRowRule) -> DQRuleManager:
+    spark_mock = create_autospec(SparkSession)
+    return DQRuleManager(
+        check=check,
+        df=df,
+        spark=spark_mock,
+        engine_user_metadata={},
+        run_time_overwrite=None,
+        run_id="test-run",
+        skip_invalid_checks=False,
+    )
+
+
+def test_rule_manager_without_skipping_does_not_validate_check():
+    """With skipping disabled an unresolvable check is neither validated nor skipped; Spark rejects it later."""
+    df_mock = create_autospec(DataFrame)
+    columns = PropertyMock(return_value=["id"])
+    type(df_mock).columns = columns
+    type(df_mock.select.return_value).schema = PropertyMock(side_effect=AnalysisException("unresolved"))
+    check = DQRowRule(
+        check_func=check_funcs.is_not_null, column="missing_col", filter="other_missing > 0", message_expr="nope"
+    )
+
+    manager = _make_manager_without_skipping(df_mock, check)
+
+    assert manager.is_skipped is False
+    assert manager.skip_message == ""
+    columns.assert_not_called()
+    df_mock.select.assert_not_called()
+
+
+def test_rule_manager_without_skipping_raises_for_unsafe_filter():
+    df_mock = create_autospec(DataFrame)
+    check = DQRowRule(check_func=check_funcs.is_not_null, column="id", filter="1=1; DROP TABLE t")
+
+    manager = _make_manager_without_skipping(df_mock, check)
+
+    with pytest.raises(UnsafeSqlQueryError):
+        manager.process()

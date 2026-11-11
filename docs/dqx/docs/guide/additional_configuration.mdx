@@ -181,6 +181,41 @@ from pyspark.sql import functions as F
 skipped = checked_df.select(F.explode("_errors").alias("e")).filter(F.col("e.skipped") == True)
 ```
 
+## Failing instead of skipping invalid checks
+
+By default, DQX validates every check against the input DataFrame before applying it. A check whose columns, filter, custom message expression, or SQL expression cannot be resolved is skipped and reported as described above, and the remaining checks are still applied.
+
+If your checks are known to match the input schema, you can turn this off by setting `skip_invalid_checks=False` in `ExtraParams`. Checks are then applied without validation, and an invalid check makes Spark reject the query with an `AnalysisException` when it is analyzed (on Spark Connect, typically at the first action, e.g. when the results are saved), before any data is processed. A check with an unsafe filter raises an `UnsafeSqlQueryError` instead of being skipped. No check is ever reported as skipped, so `suppress_skipped` has no effect.
+
+This avoids the schema analysis that validation needs. On Spark Connect (e.g. serverless compute), each analysis is a round trip to the server, which can take several seconds for complex input plans.
+
+<Admonition type="warning" title="One invalid check fails the whole run">
+With `skip_invalid_checks=False`, a single invalid check (e.g. a typo in a column name or a column removed from the input) fails the query, and none of the check results are produced. Use the default when checks may not match the input, for example when the same checks are applied to tables with different schemas.
+</Admonition>
+
+<Tabs>
+  <TabItem value="Python" label="Python" default>
+    ```python
+    from databricks.sdk import WorkspaceClient
+    from databricks.labs.dqx.engine import DQEngine
+    from databricks.labs.dqx.config import ExtraParams
+
+    # apply checks without validating them first; invalid checks make Spark fail the query
+    extra_parameters = ExtraParams(skip_invalid_checks=False)
+
+    ws = WorkspaceClient()
+    dq_engine = DQEngine(ws, extra_params=extra_parameters)
+    ```
+  </TabItem>
+  <TabItem value="Workflows" label="Workflows">
+    You can set the following fields in the [configuration file](/docs/installation/#configuration-file) to fail instead of skipping invalid checks when using DQX workflows:
+    ```yaml
+    extra_params:
+        skip_invalid_checks: false
+    ```
+  </TabItem>
+</Tabs>
+
 ## Defining default variables for substitution
 
 <FeatureTags>
