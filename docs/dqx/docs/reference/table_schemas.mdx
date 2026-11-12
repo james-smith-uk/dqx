@@ -49,6 +49,7 @@ erDiagram
     CHECKS_TABLE["Checks (Optional)"] {
         rule_fingerprint string
         rule_set_fingerprint string
+        expanded_rule_fingerprints array
         name string
         check struct
         created_at timestamp
@@ -62,7 +63,7 @@ erDiagram
 
 - **Summary metrics → Output/Quarantine**: Join on `run_id` (present in each `_errors` and `_warnings` item).
 - **Summary metrics → Checks table**: Use `checks_location` and `rule_set_fingerprint` to load the rule set.
-- **Output/Quarantine → Checks table**: Join exploded `_errors`/`_warnings` on `rule_fingerprint` and `rule_set_fingerprint`.
+- **Output/Quarantine → Checks table**: Join exploded `_errors`/`_warnings` on `rule_set_fingerprint`, and on `rule_fingerprint` against the exploded `expanded_rule_fingerprints` of the checks table. A `for_each_column` check is stored as one row but produces one result per column, each with its own `rule_fingerprint`; `expanded_rule_fingerprints` lists them.
 
 ## Result columns: `_errors` and `_warnings`
 
@@ -103,6 +104,7 @@ When storing checks in Delta or Lakebase tables (see [Loading and Storing Qualit
 | `created_at`           | TIMESTAMP                                                    | When the check was saved.                                                   |
 | `rule_fingerprint`     | STRING                                                       | SHA-256 hash of the single rule.                                            |
 | `rule_set_fingerprint` | STRING                                                       | SHA-256 hash of the complete rule set.                                      |
+| `expanded_rule_fingerprints` | ARRAY&lt;STRING&gt;                                    | `rule_fingerprint`s of the rules the check expands into when applied, in `for_each_column` order. A check without `for_each_column` has a single element. Use it to join result columns and summary metrics to the stored check. Stored as JSONB in Lakebase. |
 
 ## Summary metrics table schema
 
