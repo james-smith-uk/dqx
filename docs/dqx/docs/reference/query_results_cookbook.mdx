@@ -261,7 +261,7 @@ A rule defined with `for_each_column` is stored as a single row in the checks ta
       LATERAL VIEW explode(t._errors) AS errors
     ) e
     INNER JOIN catalog.schema.checks_table c
-      ON array_contains(c.expanded_rule_fingerprints, e.rule_fingerprint)
+      ON array_contains(coalesce(c.expanded_rule_fingerprints, array(c.rule_fingerprint)), e.rule_fingerprint)
       AND e.rule_set_fingerprint = c.rule_set_fingerprint;
     ```
   </TabItem>
@@ -276,8 +276,10 @@ A rule defined with `for_each_column` is stored as a single row in the checks ta
     )
 
     # one row per expanded rule, so results of for_each_column rules match their stored row
+    # (rows saved before expanded_rule_fingerprints existed fall back to rule_fingerprint)
     checks_df = spark.table("catalog.schema.checks_table").withColumn(
-      "rule_fingerprint", F.explode("expanded_rule_fingerprints")
+      "rule_fingerprint",
+      F.explode(F.coalesce("expanded_rule_fingerprints", F.array("rule_fingerprint"))),
     )
     result_df = (
       errors_df.alias("e")
@@ -439,7 +441,7 @@ If you also need the full check definition (function, arguments, filter), join t
       WHERE errors.run_id = '<run_id>'
     ) e
     LEFT JOIN catalog.schema.checks_table c
-      ON array_contains(c.expanded_rule_fingerprints, e.rule_fingerprint)
+      ON array_contains(coalesce(c.expanded_rule_fingerprints, array(c.rule_fingerprint)), e.rule_fingerprint)
       AND e.rule_set_fingerprint = c.rule_set_fingerprint;
     ```
   </TabItem>
@@ -455,8 +457,10 @@ If you also need the full check definition (function, arguments, filter), join t
     )
 
     # one row per expanded rule, so results of for_each_column rules match their stored row
+    # (rows saved before expanded_rule_fingerprints existed fall back to rule_fingerprint)
     checks_df = spark.table("catalog.schema.checks_table").withColumn(
-      "rule_fingerprint", F.explode("expanded_rule_fingerprints")
+      "rule_fingerprint",
+      F.explode(F.coalesce("expanded_rule_fingerprints", F.array("rule_fingerprint"))),
     )
     failed_checks_df = (
       errors_df
