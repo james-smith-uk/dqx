@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Generic, TypeVar, NoReturn
 from sqlalchemy import (
+    Connection,
     DateTime,
     Engine,
     create_engine,
@@ -22,6 +23,7 @@ from sqlalchemy import (
     Text,
     insert,
     inspect,
+    update,
     select,
     delete,
     null,
@@ -92,13 +94,26 @@ _VERSIONING_COLUMNS = tuple(_VERSIONING_COLUMN_TYPES_DELTA)
 # Non-versioning columns that must also exist on a pre-existing Delta table before a write.
 # A legacy table created before these columns were added must be ALTERed to include them,
 # otherwise saveAsTable raises a schema-mismatch AnalysisException.
-_ADDITIONAL_DELTA_COLUMN_TYPES = {"message_expr": "STRING"}
+_ADDITIONAL_DELTA_COLUMN_TYPES = {"message_expr": "STRING", "expanded_rule_fingerprints": "ARRAY<STRING>"}
 
 CHECKS_TABLE_SCHEMA = (
     "name STRING, criticality STRING, check STRUCT<function STRING, for_each_column ARRAY<STRING>,"
     " arguments MAP<STRING, STRING>>, filter STRING, run_config_name STRING, user_metadata MAP<STRING, STRING>,"
-    " message_expr STRING, created_at TIMESTAMP, rule_fingerprint STRING, rule_set_fingerprint STRING"
+    " message_expr STRING, created_at TIMESTAMP, rule_fingerprint STRING, rule_set_fingerprint STRING,"
+    " expanded_rule_fingerprints ARRAY<STRING>"
 )
+
+
+def _quote_table_name(location: str) -> str:
+    """Quote each part of a table name with backticks for use in a Spark SQL statement.
+
+    Args:
+        location: Full table name (e.g., "catalog.schema.table" or "`schema`.`table`").
+
+    Returns:
+        The table name with each part quoted, e.g. "`catalog`.`schema`.`table`".
+    """
+    return ".".join(f"`{part}`" for part in location.replace("`", "").split("."))
 
 
 class DataFrameConverter:
@@ -270,6 +285,9 @@ class DataFrameConverter:
             name, rule_fingerprint = DataFrameConverter.resolve_name_and_fingerprint(
                 original_check, check, custom_checks
             )
+            expanded_rule_fingerprints = DataFrameConverter.resolve_expanded_rule_fingerprints(
+                original_check, custom_checks
+            )
 
             # Values are already normalized by ChecksNormalizer.normalize; json.dumps for MAP<STRING, STRING>,
             # mirroring the arguments encoding so non-string user_metadata types survive the round-trip.
@@ -290,6 +308,7 @@ class DataFrameConverter:
                     effective_created_at,
                     rule_fingerprint,
                     rule_set_fingerprint,
+                    expanded_rule_fingerprints,
                 ]
             )
         return spark.createDataFrame(dq_rule_rows, CHECKS_TABLE_SCHEMA)
@@ -318,6 +337,27 @@ class DataFrameConverter:
             return normalized_check.get("name"), compute_rule_fingerprint(normalized_check)
         rule = deserialize_checks([original_check], custom_checks)[0]
         return rule.name, rule.rule_fingerprint
+
+    @staticmethod
+    def resolve_expanded_rule_fingerprints(
+        original_check: dict, custom_checks: dict[str, Callable] | None = None
+    ) -> list[str]:
+        """Resolve the fingerprints of the rules a stored check expands into at apply time.
+
+        A *for_each_column* check is stored as one compact row but expands into one rule per column when
+        applied, and each expanded rule carries its own *rule_fingerprint* in *_errors* / *_warnings* and
+        the summary metrics. Storing the expanded fingerprints lets results be joined back to the compact row.
+        The check is expanded with the same deserialization the engine uses, so the fingerprints match exactly
+        (a check filter pushed down as *row_filter*, for example, is part of each expanded rule's hash).
+
+        Args:
+            original_check: The check dictionary as provided by the caller (pre-normalization).
+            custom_checks: Optional dictionary with custom check functions (e.g., *globals()* of the calling module).
+
+        Returns:
+            The expanded rule fingerprints in *for_each_column* order; a single-element list for other checks.
+        """
+        return [rule.rule_fingerprint for rule in deserialize_checks([original_check], custom_checks)]
 
 
 class ChecksStorageHandler(ABC, Generic[T]):
@@ -421,6 +461,9 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
             - **append**: If the fingerprint differs, appends the new checks as additional rows for this
               run_config_name (multiple versions accumulate). If the fingerprint matches, no write is performed.
 
+            Backfill: If the rule set is already stored but some of its rows predate the
+            *expanded_rule_fingerprints* column, that column alone is filled in for those rows.
+
             Concurrency: The idempotency check is not atomic for Delta tables. The check-then-write sequence
             (read fingerprint → skip if found → write) is not wrapped in a transaction, so two concurrent
             callers saving the same rule set may both pass the check and both write, producing duplicate rows
@@ -465,6 +508,7 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
                 logger.info(
                     f"Checks with rule_set_fingerprint '{rule_set_fingerprint}' already exist in table '{config.location}'"
                 )
+                self._backfill_expanded_rule_fingerprints(config, existing_df, rules_df, rule_set_fingerprint)
                 return
 
         writer = rules_df.write
@@ -472,6 +516,49 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
             predicate = f"run_config_name = '{config.run_config_name}'"
             writer = writer.option("replaceWhere", predicate)
         writer.saveAsTable(config.location, mode=config.mode)
+
+    def _backfill_expanded_rule_fingerprints(
+        self,
+        config: TableChecksStorageConfig,
+        existing_df: DataFrame,
+        rules_df: DataFrame,
+        rule_set_fingerprint: str,
+    ) -> None:
+        """Fill in *expanded_rule_fingerprints* for an already-stored rule set saved before the column existed.
+
+        Only rows with a NULL *expanded_rule_fingerprints* are updated, matched on
+        (*run_config_name*, *rule_set_fingerprint*, *rule_fingerprint*). Rows whose stored *rule_fingerprint*
+        does not match the recomputed one stay NULL. Nothing is written when every row is already populated.
+
+        Args:
+            config: configuration for saving checks, including the table location and run configuration name.
+            existing_df: DataFrame of the existing checks table (including the *expanded_rule_fingerprints* column).
+            rules_df: DataFrame of the checks being saved, as built by *DataFrameConverter.to_dataframe*.
+            rule_set_fingerprint: Fingerprint of the rule set being saved.
+        """
+        missing = existing_df.filter(
+            (F.col("run_config_name") == config.run_config_name)
+            & (F.col("rule_set_fingerprint") == rule_set_fingerprint)
+            & F.col("expanded_rule_fingerprints").isNull()
+        )
+        if missing.isEmpty():
+            return
+
+        source_view = f"dqx_expanded_rule_fingerprints_{uuid.uuid4().hex}"
+        keys = ["run_config_name", "rule_set_fingerprint", "rule_fingerprint"]
+        rules_df.select(*keys, "expanded_rule_fingerprints").dropDuplicates(keys).createOrReplaceTempView(source_view)
+        try:
+            self.spark.sql(
+                f"MERGE INTO {_quote_table_name(config.location)} AS target USING {source_view} AS source"
+                " ON target.run_config_name = source.run_config_name"
+                " AND target.rule_set_fingerprint = source.rule_set_fingerprint"
+                " AND target.rule_fingerprint = source.rule_fingerprint"
+                " WHEN MATCHED AND target.expanded_rule_fingerprints IS NULL"
+                " THEN UPDATE SET target.expanded_rule_fingerprints = source.expanded_rule_fingerprints"
+            )
+        finally:
+            self.spark.sql(f"DROP VIEW IF EXISTS {source_view}")
+        logger.info(f"Backfilled expanded_rule_fingerprints for rule_set_fingerprint '{rule_set_fingerprint}'.")
 
     def _table_exists(self, location: str) -> bool:
         """Check if a Delta table exists in the workspace.
@@ -513,7 +600,7 @@ class TableChecksStorageHandler(ChecksStorageHandler[TableChecksStorageConfig]):
         if not missing:
             return False
 
-        quoted = ".".join(f"`{part}`" for part in location.replace("`", "").split("."))
+        quoted = _quote_table_name(location)
         for col in missing:
             col_type = column_types[col]
             self.spark.sql(f"ALTER TABLE {quoted} ADD COLUMN {col} {col_type}")
@@ -608,7 +695,11 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
 
     @staticmethod
     def get_table_definition(
-        schema_name: str, table_name: str, versioning: bool = True, include_message_expr: bool = True
+        schema_name: str,
+        table_name: str,
+        versioning: bool = True,
+        include_message_expr: bool = True,
+        include_expanded_fingerprints: bool = True,
     ) -> Table:
         """
         Create a SQLAlchemy table definition for storing DQ rules (checks) in Lakebase.
@@ -621,6 +712,8 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
             include_message_expr: If True (default), include the *message_expr* column. Pass False for
                 legacy tables that predate *message_expr* support, so a select does not reference a
                 column that does not exist on the table.
+            include_expanded_fingerprints: If True (default), include the *expanded_rule_fingerprints* column.
+                Pass False for legacy tables that predate it, so a select does not reference a missing column.
 
         Returns:
             SQLAlchemy table definition for the Lakebase instance.
@@ -641,6 +734,8 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
                 Column("rule_fingerprint", String(64)),
                 Column("rule_set_fingerprint", String(64)),
             ]
+        if include_expanded_fingerprints:
+            columns.append(Column("expanded_rule_fingerprints", JSONB))
         return Table(table_name, MetaData(schema=schema_name), *columns)
 
     @staticmethod
@@ -675,6 +770,9 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
             name, rule_fingerprint = DataFrameConverter.resolve_name_and_fingerprint(
                 original_check, check, custom_check_functions
             )
+            expanded_rule_fingerprints = DataFrameConverter.resolve_expanded_rule_fingerprints(
+                original_check, custom_check_functions
+            )
             user_metadata = check.get("user_metadata")
             normalized_check = {
                 "name": name,
@@ -687,6 +785,7 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
                 "created_at": created_at,
                 "rule_fingerprint": rule_fingerprint,
                 "rule_set_fingerprint": rule_set_fingerprint,
+                "expanded_rule_fingerprints": expanded_rule_fingerprints,
             }
             normalized_checks.append(normalized_check)
         return normalized_checks
@@ -755,6 +854,7 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
             )
             LakebaseChecksStorageHandler._ensure_versioning_columns(engine, config)
             LakebaseChecksStorageHandler._ensure_message_expr_column(engine, config)
+            LakebaseChecksStorageHandler._ensure_expanded_fingerprints_column(engine, config)
 
             normalized_checks = self._normalize_checks(checks, config, custom_check_functions)
 
@@ -769,6 +869,7 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
             )
             if conn.execute(exists_rule_set).first():
                 logger.info(f"Checks with rule_set_fingerprint {rule_set_fingerprint} already exist — skipping")
+                LakebaseChecksStorageHandler._backfill_expanded_rule_fingerprints(conn, table, normalized_checks)
                 return
 
             if config.mode == "overwrite":
@@ -818,6 +919,50 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
         with engine.begin() as conn:
             conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS message_expr TEXT"))
 
+    @staticmethod
+    def _ensure_expanded_fingerprints_column(engine: Engine, config: LakebaseChecksStorageConfig) -> None:
+        """Add the *expanded_rule_fingerprints* column to an existing Lakebase table when missing.
+
+        Kept out of the versioning-column check so that a table or view lacking it is not treated as a
+        legacy (unversioned) table on load. The ALTER is idempotent (ADD COLUMN IF NOT EXISTS).
+
+        Args:
+            engine: SQLAlchemy engine for the Lakebase instance.
+            config: Configuration for saving and loading checks to Lakebase.
+        """
+        tbl = f'"{config.schema_name}"."{config.table_name}"'
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS expanded_rule_fingerprints JSONB"))
+
+    @staticmethod
+    def _backfill_expanded_rule_fingerprints(conn: Connection, table: Table, normalized_checks: list[dict]) -> None:
+        """Fill in *expanded_rule_fingerprints* for an already-stored rule set saved before the column existed.
+
+        Only rows with a NULL *expanded_rule_fingerprints* are updated, matched on
+        (*run_config_name*, *rule_set_fingerprint*, *rule_fingerprint*). Rows whose stored *rule_fingerprint*
+        does not match the recomputed one stay NULL.
+
+        Args:
+            conn: Open connection inside the save transaction.
+            table: SQLAlchemy table definition of the checks table.
+            normalized_checks: The checks being saved, as built by *_normalize_checks*.
+        """
+        updated = 0
+        for check in normalized_checks:
+            stmt = (
+                update(table)
+                .where(
+                    table.c.run_config_name == check["run_config_name"],
+                    table.c.rule_set_fingerprint == check["rule_set_fingerprint"],
+                    table.c.rule_fingerprint == check["rule_fingerprint"],
+                    table.c.expanded_rule_fingerprints.is_(None),
+                )
+                .values(expanded_rule_fingerprints=check["expanded_rule_fingerprints"])
+            )
+            updated += conn.execute(stmt).rowcount
+        if updated:
+            logger.info(f"Backfilled expanded_rule_fingerprints for {updated} existing checks.")
+
     def _load_checks_from_lakebase(self, config: LakebaseChecksStorageConfig, engine: Engine) -> list[dict]:
         """
         Load dq rules (checks) from a Lakebase table.
@@ -839,11 +984,15 @@ class LakebaseChecksStorageHandler(ChecksStorageHandler[LakebaseChecksStorageCon
         has_message_expr = LakebaseChecksStorageHandler._column_exists(
             engine, config.schema_name, config.table_name, "message_expr"
         )
+        has_expanded_fingerprints = LakebaseChecksStorageHandler._column_exists(
+            engine, config.schema_name, config.table_name, "expanded_rule_fingerprints"
+        )
         table = self.get_table_definition(
             config.schema_name,
             config.table_name,
             versioning=has_versioning,
             include_message_expr=has_message_expr,
+            include_expanded_fingerprints=has_expanded_fingerprints,
         )
 
         if not has_versioning:

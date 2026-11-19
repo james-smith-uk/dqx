@@ -8,7 +8,7 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound
 
 from databricks.labs.dqx.check_funcs import make_condition
-from databricks.labs.dqx.checks_serializer import deserialize_checks, serialize_checks
+from databricks.labs.dqx.checks_serializer import ChecksNormalizer, deserialize_checks, serialize_checks
 from databricks.labs.dqx.checks_storage import (
     DataFrameConverter,
     LakebaseChecksStorageHandler,
@@ -186,7 +186,7 @@ def test_ensure_versioning_columns_strips_existing_backticks_before_quoting():
 def test_ensure_versioning_columns_skips_ddl_when_all_columns_exist():
     """No ALTER TABLE is issued when the table already has all versioning and additional columns."""
     handler, config, spark = _make_handler_with_existing_table(
-        schema_fields=[_MockField(col) for col in (*_VERSIONING_COLUMNS, "message_expr")]
+        schema_fields=[_MockField(col) for col in (*_VERSIONING_COLUMNS, "message_expr", "expanded_rule_fingerprints")]
     )
 
     handler.save(_SIMPLE_CHECK, config)
@@ -196,17 +196,18 @@ def test_ensure_versioning_columns_skips_ddl_when_all_columns_exist():
 
 def test_ensure_versioning_columns_adds_only_missing_columns():
     """Only the missing versioning and additional columns are added via ALTER TABLE."""
-    # Table already has rule_fingerprint and rule_set_fingerprint but not created_at or message_expr
+    # Table already has rule_fingerprint and rule_set_fingerprint but not the other columns
     handler, config, spark = _make_handler_with_existing_table(
         schema_fields=[_MockField("rule_fingerprint"), _MockField("rule_set_fingerprint")]
     )
 
     handler.save(_SIMPLE_CHECK, config)
 
-    assert spark.sql.call_count == 2
+    assert spark.sql.call_count == 3
     altered_columns = " ".join(call.args[0] for call in spark.sql.call_args_list)
     assert "created_at" in altered_columns
     assert "message_expr" in altered_columns
+    assert "expanded_rule_fingerprints ARRAY<STRING>" in altered_columns
     assert "rule_fingerprint " not in altered_columns
 
 
@@ -246,8 +247,9 @@ def test_save_in_append_mode_skips_write_when_computed_fingerprint_already_exist
     ws = create_autospec(WorkspaceClient)
     # _table_exists → True (ws.tables.get does not raise)
     spark.read.table.return_value.schema.fields = [_MockField(c) for c in _VERSIONING_COLUMNS]
-    # isEmpty() returns False → fingerprint already in table → idempotency guard fires
-    spark.read.table.return_value.filter.return_value.isEmpty.return_value = False
+    # First isEmpty() → fingerprint already in table → idempotency guard fires;
+    # second isEmpty() → no rows with NULL expanded_rule_fingerprints → no backfill
+    spark.read.table.return_value.filter.return_value.isEmpty.side_effect = [False, True]
 
     handler = TableChecksStorageHandler(ws, spark)
     config = TableChecksStorageConfig(
@@ -299,8 +301,9 @@ def test_save_skips_write_when_only_user_metadata_differs():
     spark = create_autospec(SparkSession)
     ws = create_autospec(WorkspaceClient)
     spark.read.table.return_value.schema.fields = [_MockField(c) for c in _VERSIONING_COLUMNS]
-    # isEmpty() returns False → computed fingerprint already exists in the table
-    spark.read.table.return_value.filter.return_value.isEmpty.return_value = False
+    # First isEmpty() → computed fingerprint already exists in the table;
+    # second isEmpty() → no rows with NULL expanded_rule_fingerprints → no backfill
+    spark.read.table.return_value.filter.return_value.isEmpty.side_effect = [False, True]
 
     handler = TableChecksStorageHandler(ws, spark)
     config = TableChecksStorageConfig(location="catalog.schema.table", run_config_name="default", mode="append")
@@ -316,6 +319,95 @@ def test_save_skips_write_when_only_user_metadata_differs():
     handler.save(check_with_metadata, config)
 
     spark.createDataFrame.return_value.write.saveAsTable.assert_not_called()
+
+
+def _make_handler_with_stored_rule_set(has_null_expanded_fingerprints: bool):
+    """Build a handler whose existing table already holds the rule set being saved."""
+    spark = create_autospec(SparkSession)
+    ws = create_autospec(WorkspaceClient)
+    spark.read.table.return_value.schema.fields = [
+        _MockField(c) for c in (*_VERSIONING_COLUMNS, "message_expr", "expanded_rule_fingerprints")
+    ]
+    # First isEmpty() → the rule set is already stored; second → whether any row lacks expanded fingerprints
+    spark.read.table.return_value.filter.return_value.isEmpty.side_effect = [False, not has_null_expanded_fingerprints]
+    handler = TableChecksStorageHandler(ws, spark)
+    config = TableChecksStorageConfig(location="catalog.schema.table", run_config_name="default", mode="append")
+    return handler, config, spark
+
+
+def test_save_backfills_expanded_fingerprints_for_stored_rule_set():
+    """Re-saving a rule set stored before expanded_rule_fingerprints existed fills in only that column."""
+    handler, config, spark = _make_handler_with_stored_rule_set(has_null_expanded_fingerprints=True)
+
+    handler.save(_SIMPLE_CHECK, config)
+
+    spark.createDataFrame.return_value.write.saveAsTable.assert_not_called()
+    statements = [call.args[0] for call in spark.sql.call_args_list]
+    merges = [stmt for stmt in statements if stmt.startswith("MERGE INTO `catalog`.`schema`.`table`")]
+    assert len(merges) == 1
+    assert "WHEN MATCHED AND target.expanded_rule_fingerprints IS NULL" in merges[0]
+    assert "target.rule_fingerprint = source.rule_fingerprint" in merges[0]
+    assert "WHEN NOT MATCHED" not in merges[0]
+    assert any(stmt.startswith("DROP VIEW IF EXISTS dqx_expanded_rule_fingerprints_") for stmt in statements)
+
+
+def test_save_skips_backfill_when_expanded_fingerprints_present():
+    """No MERGE is issued when every stored row already has expanded_rule_fingerprints (e.g. append-only tables)."""
+    handler, config, spark = _make_handler_with_stored_rule_set(has_null_expanded_fingerprints=False)
+
+    handler.save(_SIMPLE_CHECK, config)
+
+    spark.sql.assert_not_called()
+    spark.createDataFrame.return_value.write.saveAsTable.assert_not_called()
+
+
+def test_resolve_expanded_rule_fingerprints_for_plain_check():
+    """A check without for_each_column expands to a single fingerprint equal to the applied rule's."""
+    check = {"criticality": "error", "check": {"function": "is_not_null", "arguments": {"column": "id"}}}
+
+    expanded = DataFrameConverter.resolve_expanded_rule_fingerprints(check)
+
+    assert expanded == [deserialize_checks([check])[0].rule_fingerprint]
+    _, rule_fingerprint = DataFrameConverter.resolve_name_and_fingerprint(check, ChecksNormalizer.normalize([check])[0])
+    assert expanded == [rule_fingerprint]
+
+
+def test_resolve_expanded_rule_fingerprints_for_for_each_column_check_with_filter():
+    """A for_each_column check expands to the applied per-column fingerprints, in column order."""
+    check = {
+        "criticality": "warn",
+        "filter": "b > 0",
+        "check": {"function": "is_not_null", "for_each_column": ["c", "a", "b"]},
+    }
+
+    expanded = DataFrameConverter.resolve_expanded_rule_fingerprints(check)
+
+    applied = deserialize_checks([check])
+    assert expanded == [rule.rule_fingerprint for rule in applied]
+    assert [rule.column for rule in applied] == ["c", "a", "b"]
+    assert len(set(expanded)) == 3
+    _, compact_fingerprint = DataFrameConverter.resolve_name_and_fingerprint(
+        check, ChecksNormalizer.normalize([check])[0]
+    )
+    assert compact_fingerprint not in expanded
+
+
+def _custom_not_negative(column: str) -> Column:
+    return make_condition(col(column) < 0, "negative", f"{column}_negative")
+
+
+def test_resolve_expanded_rule_fingerprints_for_custom_check():
+    """Custom check functions are resolved through the provided mapping."""
+    check = {
+        "criticality": "error",
+        "check": {"function": "_custom_not_negative", "for_each_column": ["x", "y"]},
+    }
+    custom_checks = {"_custom_not_negative": _custom_not_negative}
+
+    expanded = DataFrameConverter.resolve_expanded_rule_fingerprints(check, custom_checks)
+
+    assert expanded == [rule.rule_fingerprint for rule in deserialize_checks([check], custom_checks)]
+    assert len(expanded) == 2
 
 
 def _lakebase_config() -> LakebaseChecksStorageConfig:
@@ -391,6 +483,26 @@ def test_lakebase_table_definition_omits_message_expr_when_disabled():
     # Default keeps it, mirroring the versioning column behavior.
     default_table = LakebaseChecksStorageHandler.get_table_definition("schema", "table")
     assert "message_expr" in default_table.columns
+
+
+def test_lakebase_table_definition_expanded_fingerprints_column():
+    """get_table_definition includes a JSONB expanded_rule_fingerprints column unless disabled (legacy tables)."""
+    table = LakebaseChecksStorageHandler.get_table_definition("schema", "table")
+    legacy_table = LakebaseChecksStorageHandler.get_table_definition(
+        "schema", "table", include_expanded_fingerprints=False
+    )
+
+    assert table.columns["expanded_rule_fingerprints"].type.__class__.__name__ == "JSONB"
+    assert "expanded_rule_fingerprints" not in legacy_table.columns
+
+
+def test_lakebase_normalize_checks_emits_expanded_fingerprints():
+    """_normalize_checks stores the per-column fingerprints of a for_each_column check."""
+    checks = [{"criticality": "error", "check": {"function": "is_not_null", "for_each_column": ["a", "b"]}}]
+
+    normalized = _normalize_lakebase_checks(checks, _lakebase_config())
+
+    assert normalized[0]["expanded_rule_fingerprints"] == [rule.rule_fingerprint for rule in deserialize_checks(checks)]
 
 
 def test_row_to_check_dict_omits_message_expr_for_legacy_row():
