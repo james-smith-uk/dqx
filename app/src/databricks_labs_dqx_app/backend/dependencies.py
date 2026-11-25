@@ -46,6 +46,7 @@ from .services.pending_application_service import PendingApplicationService
 from .services.materializer import Materializer
 from .services.metadata_dim_service import MetadataDimService
 from .services.monitored_table_versions import MonitoredTableVersionService
+from .services.lifecycle_history import HistoryObjectType, LifecycleHistoryService, Snapshotter
 from .services.run_sets import RunSetService
 from .services.binding_run_service import BindingRunService
 from .services.data_product_service import DataProductService
@@ -58,12 +59,14 @@ from .services.rule_retriever import CosineRuleRetriever, RuleRetriever
 from .services.rule_suggester import RuleSuggester
 from .services.rules_catalog_service import RulesCatalogService
 from .services.comments_service import CommentsService
+from .services.saved_views_service import SavedViewsService
 from .services.compute_service import ComputeService, resolve_warehouse_id
 from .services.schedule_grant_service import ScheduleGrantService
 from .services.rule_test_service import RuleTestService
 from .services.table_data_service import TableDataService
 from .services.review_status_service import ReviewStatusService
 from .services.schedule_config_service import ScheduleConfigService
+from .services.scheduler_wake import SCHEDULER_WAKE_MARKER_PATH, SchedulerWakeMarker
 from .services.tag_mapping_service import ColumnInfo
 from .services.tag_reconcile_service import TagReconcileService
 from .services.tag_suggestion_service import TagSuggestionService
@@ -106,6 +109,15 @@ _OBO_TTL = 45 * 60  # 45 minutes
 _CATALOG_TTL = 30  # seconds — see get_user_catalog_names for the revocation trade-off
 _SETUP_ACCESS_TTL = 10  # seconds — matches the setup-required polling interval
 _WORKSPACE_ADMINS_GROUP = "admins"  # workspace administrators may always run setup
+
+
+def get_scheduler_wake_marker() -> SchedulerWakeMarker:
+    """The cross-process signal that wakes the scheduler from its idle sleep.
+
+    Signalling costs one file append — no SQL, no network — so run-start
+    routes and page-load list endpoints can call it on every request.
+    """
+    return SchedulerWakeMarker(SCHEDULER_WAKE_MARKER_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +736,13 @@ async def get_comments_service(
     return CommentsService(sql=sql)
 
 
+async def get_saved_views_service(
+    sql: Annotated[OltpExecutorProtocol, Depends(get_sp_oltp_executor)],
+) -> SavedViewsService:
+    """Create a SavedViewsService routed at the OLTP executor."""
+    return SavedViewsService(sql=sql)
+
+
 async def get_compute_service(
     sp_ws: Annotated[WorkspaceClient, Depends(get_sp_ws)],
     app_settings: Annotated[AppSettingsService, Depends(get_app_settings_service)],
@@ -1051,6 +1070,32 @@ async def get_data_product_service(
     )
 
 
+def lifecycle_snapshotters(
+    version_service: MonitoredTableVersionService, data_products: DataProductService
+) -> dict[HistoryObjectType, Snapshotter]:
+    """What a history step of each kind records as the object's state after it.
+
+    Rules record their own steps (in :class:`RegistryService`) and pass their snapshot in.
+    """
+    return {"monitored_table": version_service.current_checks, "data_product": data_products.current_state}
+
+
+async def get_lifecycle_history_service(
+    sql: Annotated[OltpExecutorProtocol, Depends(get_sp_oltp_executor)],
+    version_service: Annotated[MonitoredTableVersionService, Depends(get_monitored_table_version_service)],
+    data_products: Annotated[DataProductService, Depends(get_data_product_service)],
+) -> LifecycleHistoryService:
+    """Create the LifecycleHistoryService for routes that record steps (it snapshots tables and collections)."""
+    return LifecycleHistoryService(sql, snapshotters=lifecycle_snapshotters(version_service, data_products))
+
+
+async def get_lifecycle_history_reader(
+    sql: Annotated[OltpExecutorProtocol, Depends(get_sp_oltp_executor)],
+) -> LifecycleHistoryService:
+    """A LifecycleHistoryService for routes that only read history (no snapshotters, so none of their services)."""
+    return LifecycleHistoryService(sql)
+
+
 async def get_export_service(
     registry: Annotated[RegistryService, Depends(get_registry_service)],
     app_settings: Annotated[AppSettingsService, Depends(get_app_settings_service)],
@@ -1101,6 +1146,7 @@ async def get_demo_seed_service(
     reset_service: Annotated[DatabaseResetService, Depends(get_database_reset_service)],
     embeddings: Annotated[RuleEmbeddingsService, Depends(get_rule_embeddings_service)],
     schedule_config: Annotated[ScheduleConfigService, Depends(get_schedule_config_service)],
+    saved_views: Annotated[SavedViewsService, Depends(get_saved_views_service)],
 ) -> "DemoSeedService":
     """Assemble the demo-seed orchestrator with an SP-only service graph.
 
@@ -1183,12 +1229,14 @@ async def get_demo_seed_service(
         status=status,
         reset_service=reset_service,
         embeddings=embeddings,
+        history=LifecycleHistoryService(oltp, snapshotters=lifecycle_snapshotters(version_service, data_products)),
         job_service=job_service,
         profiler_view=profiler_view,
         schedule_config=schedule_config,
         schedule_grants=ScheduleGrantService(
             obo_ws=sp_ws, sp_ws=sp_ws, job_id=str(_require_resolved_job_id()), warehouse_id=warehouse_id or ""
         ),
+        saved_views=saved_views,
         catalog=resources.volume.catalog,
         schema=resources.demo_schema,
     )
@@ -1515,6 +1563,7 @@ __all__ = [
     "get_sql_connector",
     "get_user_role",
     "get_comments_service",
+    "get_saved_views_service",
     "get_compute_service",
     "get_schedule_grant_service",
     "get_preview_sql_executor",

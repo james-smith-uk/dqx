@@ -568,21 +568,52 @@ class RulesCatalogService:
                 )
 
     def _check_no_duplicate_pending_or_approved(self, entry: RuleCatalogEntry) -> None:
-        """Raise ValueError if another pending/approved rule with the same check exists."""
-        check_sig = json.dumps(entry.checks[0].get("check", {}) if entry.checks else {}, sort_keys=True)
-        siblings = self.list_rules_for_table(entry.table_fqn)
-        for sibling in siblings:
+        """Raise ValueError if another pending/approved rule on the table duplicates *entry*.
+
+        A duplicate renders the same check function + arguments AND the same
+        rule-level *filter*: two checks that only differ by which rows they
+        validate (e.g. an unfiltered and a region-filtered not-null on one
+        column) are distinct rules. Between two registry-materialized rows the
+        content alone never decides it — each row is unique per applied rule
+        and mapping, and two different registry rules may legitimately render
+        the same check on one column — so such rows only collide when they also
+        come from the same registry rule.
+        """
+        entry_sig = self._pending_duplicate_signature(entry)
+        entry_registry_id = self._registry_rule_id(entry)
+        for sibling in self.list_rules_for_table(entry.table_fqn):
             if sibling.rule_id == entry.rule_id:
                 continue
             if sibling.status not in ("pending_approval", "approved"):
                 continue
-            sib_sig = json.dumps(sibling.checks[0].get("check", {}) if sibling.checks else {}, sort_keys=True)
-            if sib_sig == check_sig:
-                raise ValueError(
-                    f"A duplicate rule with the same check already exists "
-                    f"(rule_id={sibling.rule_id}, status={sibling.status}). "
-                    f"Cannot submit a duplicate for approval."
-                )
+            if self._pending_duplicate_signature(sibling) != entry_sig:
+                continue
+            sibling_registry_id = self._registry_rule_id(sibling)
+            if entry_registry_id is not None and sibling_registry_id is not None:
+                if entry_registry_id != sibling_registry_id:
+                    continue
+            raise ValueError(
+                f"A duplicate rule with the same check already exists "
+                f"(rule_id={sibling.rule_id}, status={sibling.status}). "
+                f"Cannot submit a duplicate for approval."
+            )
+
+    @staticmethod
+    def _pending_duplicate_signature(entry: RuleCatalogEntry) -> str:
+        """Identity of a rule for the submit-time duplicate guard: check body plus rule filter."""
+        check = entry.checks[0] if entry.checks else {}
+        raw_filter = check.get("filter")
+        rule_filter = raw_filter.strip() if isinstance(raw_filter, str) else ""
+        return json.dumps({"check": check.get("check", {}), "filter": rule_filter}, sort_keys=True)
+
+    @staticmethod
+    def _registry_rule_id(entry: RuleCatalogEntry) -> str | None:
+        """Registry rule a materialized row was rendered from, or None for authored rows."""
+        if entry.source != RuleSource.registry.value or not entry.checks:
+            return None
+        metadata = entry.checks[0].get("user_metadata")
+        registry_rule_id = metadata.get("registry_rule_id") if isinstance(metadata, dict) else None
+        return registry_rule_id if isinstance(registry_rule_id, str) and registry_rule_id else None
 
     def _row_to_entry(self, row: list[str]) -> RuleCatalogEntry:
         """Convert a query result row to a RuleCatalogEntry.
@@ -618,70 +649,6 @@ class RulesCatalogService:
             source=row[8] if len(row) > 8 and row[8] else "ui",
             rule_id=row[9] if len(row) > 9 and row[9] else None,
         )
-
-    def get_history(self, rule_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        """Return a rule's recorded change history (newest first).
-
-        Reads the append-only ``dq_resolved_rules_history`` audit trail written
-        by :meth:`_record_history`. Each entry carries the post-state ``check``
-        payload and the ``prev_status``/``new_status`` transition, so callers
-        (Drafts & Review's change-diff popout) can reconstruct a
-        previous-vs-proposed diff without walking the whole log.
-
-        Best-effort read: a warehouse hiccup or malformed row yields an empty
-        list rather than raising — the audit trail is a non-critical read path.
-
-        Args:
-            rule_id: The rule whose history to fetch.
-            limit: Maximum number of newest entries to return.
-
-        Returns:
-            A list of history-entry dicts (newest first), each with keys
-            ``rule_id``, ``table_fqn``, ``check``, ``version``, ``source``,
-            ``action``, ``prev_status``, ``new_status``, ``changed_by``,
-            ``changed_at``.
-        """
-        try:
-            e = escape_sql_string(rule_id)
-            check_text = self._sql.select_json_text(self._check_col)
-            changed_at = self._sql.ts_text("changed_at")
-            sql = (
-                f"SELECT rule_id, table_fqn, {check_text} AS check_json, version, source, "  # noqa: S608
-                f"action, prev_status, new_status, changed_by, {changed_at} AS changed_at "
-                f"FROM {self._history_table} WHERE rule_id = '{e}' "
-                f"ORDER BY changed_at DESC LIMIT {int(limit)}"
-            )
-            rows = self._sql.query(sql)
-            return [self._history_row_to_dict(row) for row in rows]
-        except Exception:
-            logger.warning("Failed to read history for rule %s (non-fatal)", rule_id, exc_info=True)
-            return []
-
-    @staticmethod
-    def _history_row_to_dict(row: list[str]) -> dict[str, Any]:
-        """Map a raw ``dq_resolved_rules_history`` row to a serializable dict."""
-        check_raw = row[2]
-        check: dict[str, Any] | None = None
-        if check_raw:
-            try:
-                parsed = json.loads(check_raw, strict=False)
-                if isinstance(parsed, dict):
-                    check = parsed
-            except (json.JSONDecodeError, TypeError):
-                check = None
-        version = int(row[3]) if row[3] not in (None, "") else None
-        return {
-            "rule_id": row[0],
-            "table_fqn": row[1],
-            "check": check,
-            "version": version,
-            "source": row[4],
-            "action": row[5],
-            "prev_status": row[6],
-            "new_status": row[7],
-            "changed_by": row[8],
-            "changed_at": row[9],
-        }
 
     def _record_history(
         self,

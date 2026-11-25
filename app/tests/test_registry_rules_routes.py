@@ -7,7 +7,7 @@ thin adapters over ``RegistryService``, whose behaviour is already covered
 by ``test_registry_service.py``.
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from fastapi import BackgroundTasks, HTTPException
@@ -21,6 +21,8 @@ from databricks_labs_dqx_app.backend.models import (
     UpdateRegistryRuleIn,
 )
 from databricks_labs_dqx_app.backend.registry_models import RegistryRule, RuleDefinition
+from databricks_labs_dqx_app.backend.services.lifecycle_history import HistoryEvent, LifecycleHistoryService
+from databricks_labs_dqx_app.backend.services.registry_service import RegistryService
 from databricks_labs_dqx_app.backend.routes.v1.registry_rules import (
     approve_registry_rule,
     backfill_rule_embeddings,
@@ -29,6 +31,8 @@ from databricks_labs_dqx_app.backend.routes.v1.registry_rules import (
     delete_registry_rule,
     deprecate_registry_rule,
     get_registry_rule,
+    get_registry_rule_snapshot,
+    list_registry_rule_history,
     list_registry_rule_versions,
     list_registry_rules,
     reject_registry_rule,
@@ -469,6 +473,37 @@ class TestBatchImport:
         assert len(result.reused) == 1
         assert result.reused[0].rule.rule_id == "r1"
         svc.create_rule.assert_called_once()
+
+    def test_skip_duplicates_keeps_rules_that_differ_only_in_filter(self):
+        # Same check on different rows is two rules: the second must not be
+        # reported as reused (and inherit the first rule's filter).
+        svc = create_autospec(RegistryService, instance=True)
+        svc.compute_definition_fingerprint.side_effect = ["fp100", "fp200"]
+        svc.get_active_rule_by_fingerprint.return_value = None
+        svc.create_rule.side_effect = [(_rule("r100"), None), (_rule("r200"), None)]
+        code_100 = _definition().model_copy(update={"filter": "error_code = 100"})
+        code_200 = _definition().model_copy(update={"filter": "error_code = 200"})
+        body = BatchImportRegistryRulesIn(
+            rules=[
+                CreateRegistryRuleIn(mode="dqx_native", definition=code_100),
+                CreateRegistryRuleIn(mode="dqx_native", definition=code_200),
+            ],
+            skip_duplicates=True,
+        )
+        result = batch_import_registry_rules(
+            body=body,
+            svc=svc,
+            embeddings=MagicMock(),
+            app_settings=MagicMock(),
+            user_email="alice@x",
+            role=UserRole.RULE_AUTHOR,
+        )
+        assert [c.rule.rule_id for c in result.created] == ["r100", "r200"]
+        assert result.reused == []
+        assert [call.kwargs["definition"].filter for call in svc.create_rule.call_args_list] == [
+            "error_code = 100",
+            "error_code = 200",
+        ]
 
     def test_skip_duplicates_off_never_dedupes(self):
         # Default posture: no fingerprinting, both identical rules are created.
@@ -1183,3 +1218,35 @@ class TestBackfillRuleEmbeddings:
 
         assert result.total_published == 1
         assert result.embedded == 0
+
+
+class TestListRegistryRuleHistory:
+    def test_returns_the_rule_review_trail(self):
+        history = create_autospec(LifecycleHistoryService, instance=True)
+        history.list_events.return_value = [
+            HistoryEvent(action="approved", actor="bob@x", created_at="2026-10-02", rationale="ok", version=2),
+            HistoryEvent(action="submitted", actor="alice@x", created_at="2026-10-01", rationale="ready"),
+        ]
+        out = list_registry_rule_history("r1", history=history)
+        history.list_events.assert_called_once_with("registry_rule", "r1")
+        assert [(e.action, e.actor, e.version) for e in out] == [
+            ("approved", "bob@x", 2),
+            ("submitted", "alice@x", None),
+        ]
+
+
+class TestRuleSnapshot:
+    def test_returns_the_rule_a_step_left(self):
+        history = create_autospec(LifecycleHistoryService, instance=True)
+        snapshot = {"mode": "dqx_native", "polarity": None, "definition": {"x": 2}, "user_metadata": {}}
+        history.get_snapshot.return_value = (True, snapshot)
+        out = get_registry_rule_snapshot("r1", 5, history=history)
+        history.get_snapshot.assert_called_once_with("registry_rule", "r1", 5)
+        assert (out.history_id, out.snapshot) == (5, snapshot)
+
+    def test_an_unknown_step_is_404(self):
+        history = create_autospec(LifecycleHistoryService, instance=True)
+        history.get_snapshot.return_value = (False, None)
+        with pytest.raises(HTTPException) as exc:
+            get_registry_rule_snapshot("r1", 5, history=history)
+        assert exc.value.status_code == 404

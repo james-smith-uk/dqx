@@ -301,6 +301,69 @@ class TestStatusTransitions:
         assert (to_status in valid) is allowed
 
 
+def _not_null_amount(*, filter_expr: str | None = None, registry_rule_id: str | None = None) -> dict:
+    """A materialized ``is_not_null(amount)`` check, optionally rule-filtered / registry-sourced."""
+    check: dict = {
+        "criticality": "error",
+        "check": {"function": "is_not_null", "arguments": {"column": "amount"}},
+    }
+    if filter_expr is not None:
+        check["filter"] = filter_expr
+    if registry_rule_id is not None:
+        check["user_metadata"] = {"registry_rule_id": registry_rule_id, "applied_rule_id": f"ar-{registry_rule_id}"}
+    return check
+
+
+class TestSubmitDuplicateGuard:
+    """``set_status(..., 'pending_approval')`` rejects true duplicates only."""
+
+    def test_registry_rules_differing_only_by_filter_both_submit(self, svc, resolved_rules_store):
+        resolved_rules_store.add("q-all", _not_null_amount(registry_rule_id="rr-all"))
+        resolved_rules_store.add("q-eu", _not_null_amount(filter_expr="region = 'EU'", registry_rule_id="rr-eu"))
+
+        svc.set_status("q-all", "pending_approval", "alice@x")
+        svc.set_status("q-eu", "pending_approval", "alice@x")
+
+        assert dict(resolved_rules_store.statuses()) == {"q-all": "pending_approval", "q-eu": "pending_approval"}
+
+    def test_different_registry_rules_with_identical_check_both_submit(self, svc, resolved_rules_store):
+        # Two distinct registry rules rendering the same check on one column are
+        # separate applications (unique per binding/rule/mapping) and must coexist.
+        resolved_rules_store.add("q-a", _not_null_amount(registry_rule_id="rr-a"))
+        resolved_rules_store.add("q-b", _not_null_amount(registry_rule_id="rr-b"))
+
+        svc.set_status("q-a", "pending_approval", "alice@x")
+        svc.set_status("q-b", "pending_approval", "alice@x")
+
+        assert dict(resolved_rules_store.statuses()) == {"q-a": "pending_approval", "q-b": "pending_approval"}
+
+    def test_authored_rules_differing_only_by_filter_both_submit(self, svc, resolved_rules_store):
+        resolved_rules_store.add("u-all", _not_null_amount(), source="ui")
+        resolved_rules_store.add("u-eu", _not_null_amount(filter_expr="region = 'EU'"), source="ui")
+
+        svc.set_status("u-all", "pending_approval", "alice@x")
+        svc.set_status("u-eu", "pending_approval", "alice@x")
+
+        assert dict(resolved_rules_store.statuses()) == {"u-all": "pending_approval", "u-eu": "pending_approval"}
+
+    @pytest.mark.parametrize("filter_expr", [None, "region = 'EU'"])
+    def test_authored_rules_with_identical_check_and_filter_still_raise(self, svc, resolved_rules_store, filter_expr):
+        resolved_rules_store.add("u-1", _not_null_amount(filter_expr=filter_expr), source="ui", status="approved")
+        resolved_rules_store.add("u-2", _not_null_amount(filter_expr=filter_expr), source="ui")
+
+        with pytest.raises(ValueError, match="duplicate"):
+            svc.set_status("u-2", "pending_approval", "alice@x")
+
+        assert dict(resolved_rules_store.statuses())["u-2"] == "draft"
+
+    def test_blank_filter_is_treated_as_no_filter(self, svc, resolved_rules_store):
+        resolved_rules_store.add("u-1", _not_null_amount(), source="ui", status="approved")
+        resolved_rules_store.add("u-2", _not_null_amount(filter_expr="  "), source="ui")
+
+        with pytest.raises(ValueError, match="duplicate"):
+            svc.set_status("u-2", "pending_approval", "alice@x")
+
+
 # ---------------------------------------------------------------------------
 # RuleCatalogEntry constructor sanity
 # ---------------------------------------------------------------------------
@@ -325,75 +388,6 @@ class TestRuleCatalogEntry:
         assert e.version == 4
         assert e.status == "approved"
         assert e.rule_id == "abc123"
-
-
-# ---------------------------------------------------------------------------
-# get_history / _history_row_to_dict — Drafts & Review change-diff backing
-# ---------------------------------------------------------------------------
-
-
-class TestHistoryRowToDict:
-    def test_parses_full_row(self):
-        row = [
-            "rule-1",
-            "cat.sch.tbl",
-            '{"check": {"function": "is_not_null"}, "criticality": "error"}',
-            "3",
-            "ui",
-            "approve",
-            "pending_approval",
-            "approved",
-            "alice@x",
-            "2026-07-01 12:00:00",
-        ]
-        out = RulesCatalogService._history_row_to_dict(row)
-        assert out["rule_id"] == "rule-1"
-        assert out["table_fqn"] == "cat.sch.tbl"
-        assert out["check"] == {"check": {"function": "is_not_null"}, "criticality": "error"}
-        assert out["version"] == 3
-        assert out["action"] == "approve"
-        assert out["prev_status"] == "pending_approval"
-        assert out["new_status"] == "approved"
-        assert out["changed_by"] == "alice@x"
-
-    def test_null_check_and_version_tolerated(self):
-        row = ["rule-1", "cat.sch.tbl", None, "", "ui", "create", None, "draft", "bob@x", None]
-        out = RulesCatalogService._history_row_to_dict(row)
-        assert out["check"] is None
-        assert out["version"] is None
-        assert out["changed_at"] is None
-
-    def test_malformed_check_json_becomes_none(self):
-        row = ["r", "a.b.c", "{not valid json", "1", "ui", "edit", None, None, None, None]
-        out = RulesCatalogService._history_row_to_dict(row)
-        assert out["check"] is None
-
-
-class TestGetHistory:
-    def test_returns_mapped_rows_newest_first(self, svc):
-        svc._sql.query.return_value = [
-            [
-                "r",
-                "a.b.c",
-                '{"function": "is_not_null"}',
-                "2",
-                "ui",
-                "submit",
-                "draft",
-                "pending_approval",
-                "a@x",
-                "t2",
-            ],
-            ["r", "a.b.c", '{"function": "is_not_null"}', "1", "ui", "create", None, "draft", "a@x", "t1"],
-        ]
-        out = svc.get_history("r")
-        assert len(out) == 2
-        assert out[0]["action"] == "submit"
-        assert out[1]["action"] == "create"
-
-    def test_swallows_query_error(self, svc):
-        svc._sql.query.side_effect = RuntimeError("warehouse down")
-        assert svc.get_history("r") == []
 
 
 # ---------------------------------------------------------------------------

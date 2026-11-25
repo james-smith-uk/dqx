@@ -18,6 +18,7 @@ import pytest
 from databricks_labs_dqx_app.backend.demo import manifest, redate
 from databricks_labs_dqx_app.backend.demo.seed_service import DemoSeedService
 from databricks_labs_dqx_app.backend.demo.status import DemoStatusStore
+from databricks_labs_dqx_app.backend.services.lifecycle_history import LifecycleHistoryService
 from databricks_labs_dqx_app.backend.services.registry_service import RegistryService
 from databricks_labs_dqx_app.backend.services.resource_tagging_service import ResourceTaggingService, demo_tag_targets
 
@@ -385,6 +386,48 @@ def test_run_approves_bindings_and_products_not_relying_on_auto_publish():
     assert deps["materializer"].materialize_binding.called
     assert deps["version_service"].freeze_new_version.called
     assert deps["data_products"].approve.called
+
+
+def test_run_records_each_table_and_collection_lifecycle_like_the_routes():
+    # The seed drives tables and collections through services, not the routes
+    # that record their history, so it records the same steps itself.
+    history = create_autospec(LifecycleHistoryService, instance=True)
+    svc, deps = _svc(history=history)
+    _use_create_path(deps)
+    deps["monitored_tables"].register.side_effect = lambda fqn, _user: MagicMock(binding_id=f"b:{fqn}")
+    deps["version_service"].freeze_new_version.return_value = 1
+    deps["data_products"].create.side_effect = lambda name, *_a: MagicMock(product_id=f"p:{name}")
+    deps["data_products"].approve.return_value = MagicMock(version=1)
+
+    svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    steps = [(c.args[0], c.args[1], c.args[2], c.kwargs.get("version")) for c in history.record.call_args_list]
+    first_table = f"b:{svc_table_fqn(manifest.BINDINGS[0].table)}"
+    assert [(a, v) for kind, oid, a, v in steps if kind == "monitored_table" and oid == first_table] == [
+        ("create", None),
+        ("update", None),
+        ("submit", None),
+        ("approve", 1),
+    ]
+    first_product = f"p:{manifest.DATA_PRODUCTS[0].name}"
+    product_steps = [(a, v) for kind, oid, a, v in steps if kind == "data_product" and oid == first_product]
+    assert product_steps[0] == ("create", None)
+    assert product_steps[-2:] == [("submit", None), ("approve", 1)]
+    assert [a for a, _ in product_steps[1:-2]] == ["update"]
+    member_steps = [
+        c
+        for c in history.record.call_args_list
+        if c.args[0] == "data_product" and c.args[1] == first_product and c.args[2] == "update"
+    ]
+    # The tables are added in one save, so one edit, recorded as the save endpoint
+    # records it (back to draft, the tables it added).
+    assert len(member_steps) == 1
+    assert member_steps[0].kwargs["new_status"] == "draft"
+    assert len(member_steps[0].kwargs["details"]["members_added"]) == len(manifest.DATA_PRODUCTS[0].members)
+
+
+def svc_table_fqn(table: str) -> str:
+    return f"dqx.{DEMO_SCHEMA}.{table}"
 
 
 def test_weekly_trend_uses_passed_rule_map_never_refingerprints():
@@ -1815,3 +1858,171 @@ def test_schedules_phase_is_a_noop_without_schedule_config():
     assert result.schedules == 0
     assert not deps["monitored_tables"].update_schedule.called
     assert not deps["data_products"].update.called
+
+
+# ---------------------------------------------------------------------------
+# Saved views phase
+# ---------------------------------------------------------------------------
+
+
+def _saved_views_fake():
+    """Autospec'd SavedViewsService backed by an in-memory list of views."""
+    from databricks_labs_dqx_app.backend.saved_views_models import SavedViewListOut, SavedViewOut
+    from databricks_labs_dqx_app.backend.services.saved_views_service import SavedViewsService
+
+    store: list[SavedViewOut] = []
+    owners: dict[str, str] = {}
+    fake = create_autospec(SavedViewsService, instance=True)
+
+    def _list(page, *, user, is_admin):
+        # Mirrors the real service: org views plus the caller's own personal views.
+        visible = [v for v in store if v.page == page and (v.scope.value == "org" or owners.get(v.id) == user)]
+        return SavedViewListOut(views=visible, effective_default_id=f"builtin:{page.value}")
+
+    def _create(body, *, user, is_admin):
+        view = SavedViewOut(
+            id=f"v{len(store)}",
+            page=body.page,
+            name=body.name,
+            scope=body.scope,
+            payload=body.payload,
+            is_builtin=False,
+            is_org_default=body.make_org_default,
+            is_my_default=body.make_my_default,
+            starred=False,
+            can_edit=True,
+            can_set_org_default=True,
+        )
+        store.append(view)
+        owners[view.id] = user
+        return view
+
+    def _update(view_id, payload, *, user, is_admin):
+        assert owners.get(view_id) == user, "seed must only update the seeding user's own views"
+        index = next(i for i, v in enumerate(store) if v.id == view_id)
+        store[index] = store[index].model_copy(update={"payload": payload})
+        return store[index]
+
+    fake.list_views.side_effect = _list
+    fake.create_view.side_effect = _create
+    fake.update_view.side_effect = _update
+    fake.owners = owners
+    return fake, store
+
+
+def _views_svc(saved_views, **over):
+    svc, deps = _svc(saved_views=saved_views, **over)
+    _use_create_path(deps)
+    deps["monitored_tables"].register.return_value = MagicMock(binding_id="b1")
+    deps["data_products"].create.return_value = MagicMock(product_id="p1")
+    return svc, deps
+
+
+def test_seed_creates_demo_personal_views_scoped_to_the_injected_catalog_and_schema():
+    from databricks_labs_dqx_app.backend.saved_views_models import SavedViewPage, SavedViewScope
+
+    fake, store = _saved_views_fake()
+    svc, deps = _views_svc(fake, catalog="acme", schema="acme_demo")
+
+    result = svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    assert result.saved_views == 4
+    assert {(v.page, v.name) for v in store} == {
+        (SavedViewPage.MONITORED_TABLES, "Demo Tables Only"),
+        (SavedViewPage.GLOBAL_RESULTS, "Demo Tables Only"),
+        (SavedViewPage.REGISTRY_RULES, "Validity Rules by Severity"),
+        (SavedViewPage.COLLECTIONS, "Collection Health"),
+    }
+    assert all(v.scope == SavedViewScope.USER and not v.is_org_default and not v.is_my_default for v in store)
+    assert set(fake.owners.values()) == {"admin@example.com"}
+    by_page = {v.page: v.payload for v in store}
+    tables = by_page[SavedViewPage.MONITORED_TABLES]
+    results = by_page[SavedViewPage.GLOBAL_RESULTS]
+    assert tables is not None and results is not None
+    assert tables.values == {"groupBy": "dqScore", "catalog": "acme", "schema": "acme_demo"}
+    assert results.values == {"catalog": ["acme"], "schema": ["acme.acme_demo"]}
+    for call in fake.create_view.call_args_list:
+        assert call.kwargs == {"user": "admin@example.com", "is_admin": True}
+    phases = [c.args[0].phase for c in deps["status"].set.call_args_list]
+    assert phases.index("products") < phases.index("views") < phases.index("schedules")
+    assert "{catalog}" not in json.dumps([v.payload.model_dump() for v in store if v.payload])
+
+
+def test_reseed_updates_existing_demo_views_instead_of_duplicating():
+    fake, store = _saved_views_fake()
+    svc, _deps = _views_svc(fake, catalog="acme", schema="acme_demo")
+    svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+    ids = sorted(v.id for v in store)
+
+    result = svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    assert result.saved_views == 4
+    assert sorted(v.id for v in store) == ids
+    assert fake.create_view.call_count == 4
+    assert fake.update_view.call_count == 4
+
+
+def test_reseed_matches_existing_demo_views_case_insensitively():
+    # View names are unique on lower(name), so a re-seed must update a view whose
+    # name differs only in case instead of trying to insert a duplicate.
+    fake, store = _saved_views_fake()
+    svc, _deps = _views_svc(fake, catalog="acme", schema="acme_demo")
+    svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+    ids = sorted(v.id for v in store)
+    for index, view in enumerate(store):
+        store[index] = view.model_copy(update={"name": view.name.upper()})
+
+    result = svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    assert result.saved_views == 4
+    assert sorted(v.id for v in store) == ids
+    assert fake.create_view.call_count == 4
+    assert fake.update_view.call_count == 4
+
+
+def test_another_seeding_admin_gets_their_own_demo_views_and_leaves_others_untouched():
+    fake, store = _saved_views_fake()
+    svc, _deps = _views_svc(fake, catalog="acme", schema="acme_demo")
+    svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    svc.run(user_email="other@example.com", wipe_first=False, weeks=0)
+
+    assert len(store) == 8
+    assert fake.update_view.call_count == 0
+    assert sorted(fake.owners.values()) == ["admin@example.com"] * 4 + ["other@example.com"] * 4
+
+
+def test_failed_demo_view_is_logged_and_the_seed_continues(caplog: pytest.LogCaptureFixture):
+    from databricks_labs_dqx_app.backend.saved_views_models import SavedViewPage
+
+    fake, store = _saved_views_fake()
+    create = fake.create_view.side_effect
+
+    def _flaky(body, *, user, is_admin):
+        if body.page == SavedViewPage.REGISTRY_RULES:
+            raise RuntimeError("boom\nforged line")
+        return create(body, user=user, is_admin=is_admin)
+
+    fake.create_view.side_effect = _flaky
+    svc, deps = _views_svc(fake)
+
+    with caplog.at_level("WARNING"):
+        result = svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    assert result.saved_views == 3
+    assert len(store) == 3
+    assert deps["status"].set.call_args_list[-1].args[0].state == "succeeded"
+    messages = [r.getMessage() for r in caplog.records if "Validity Rules by Severity" in r.getMessage()]
+    assert messages and all("\n" not in m for m in messages)
+
+
+def test_saved_views_phase_is_a_noop_without_saved_views_service():
+    svc, deps = _svc()
+    _use_create_path(deps)
+    deps["monitored_tables"].register.return_value = MagicMock(binding_id="b1")
+    deps["data_products"].create.return_value = MagicMock(product_id="p1")
+
+    result = svc.run(user_email="admin@example.com", wipe_first=False, weeks=0)
+
+    assert result.saved_views == 0
+    assert deps["status"].set.call_args_list[-1].args[0].state == "succeeded"
